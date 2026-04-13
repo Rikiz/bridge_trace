@@ -75,12 +75,25 @@ RETURN func.name AS consumer_function,
        ep.uri AS consumed_endpoint
 """
 
-_TRACE_CONSUMES_BY_FUNC_CYPHER = """
-MATCH (func:Function {id: $func_id})-[:CONSUMES]->(ep:Endpoint)
-RETURN ep.uri AS consumed_endpoint,
-       ep.role AS endpoint_role,
-       ep.file_path AS endpoint_file,
-       ep.function_name AS endpoint_function
+_TRACE_CROSS_REPO_FULL_CYPHER = """
+MATCH (ep:Endpoint {uri: $uri})
+OPTIONAL MATCH (ep)<-[:IMPLEMENTED_BY]-(impl_func:Function)
+OPTIONAL MATCH (ep)-[:ROUTES_TO]->(routed_ep:Endpoint)
+OPTIONAL MATCH (routed_ep)<-[:IMPLEMENTED_BY]-(routed_func:Function)
+OPTIONAL MATCH (ep)-[:CALLS]->(called_ep:Endpoint)
+OPTIONAL MATCH (called_ep)<-[:IMPLEMENTED_BY]-(called_func:Function)
+RETURN ep.uri AS endpoint,
+       ep.role AS role,
+       ep.file_path AS file_path,
+       ep.function_name AS function_name,
+       impl_func.name AS implementing_function,
+       impl_func.file_path AS implementing_file,
+       routed_ep.uri AS routed_endpoint,
+       routed_func.name AS routed_function,
+       routed_func.file_path AS routed_file,
+       called_ep.uri AS called_endpoint,
+       called_func.name AS called_function,
+       called_func.file_path AS called_file
 """
 
 
@@ -102,7 +115,8 @@ class TraceResult:
         for i, rec in enumerate(self.records, 1):
             lines.append(f"--- Hop {i} ---")
             for key, val in rec.items():
-                lines.append(f"  {key}: {val}")
+                if val is not None:
+                    lines.append(f"  {key}: {val}")
         return "\n".join(lines)
 
 
@@ -113,7 +127,10 @@ class TraceEngine:
         self._client = client
 
     def trace_uri(self, uri: str, group: str | None = None) -> TraceResult:
-        """Trace the full topology for a given URI path."""
+        """Trace the full topology for a given URI path.
+
+        Tries call-chain query first, falls back to cross-repo routing query.
+        """
         if group:
             records = self._client.run(
                 _TRACE_FULL_CYPHER,
@@ -122,10 +139,11 @@ class TraceEngine:
         else:
             records = self._client.run(_TRACE_CYPHER, {"uri": uri})
 
-        if not records:
-            logger.info("No trace found for URI: %s", uri)
+        if records:
+            return TraceResult(records)
 
-        return TraceResult(records)
+        logger.info("No call-chain trace for URI, trying cross-repo routing: %s", uri)
+        return self.trace_cross_repo_full(uri)
 
     def trace_uri_to_implementation(self, uri: str, group: str) -> TraceResult:
         """Trace from URI to backend implementation function."""
@@ -144,9 +162,17 @@ class TraceEngine:
         return TraceResult(records)
 
     def trace_cross_repo(self, uri: str) -> TraceResult:
-        """Trace cross-repository routing: gateway endpoint → backend endpoint."""
+        """Trace cross-repository routing: gateway endpoint -> backend endpoint."""
         records = self._client.run(
             _TRACE_CROSS_REPO_CYPHER,
+            {"uri": uri},
+        )
+        return TraceResult(records)
+
+    def trace_cross_repo_full(self, uri: str) -> TraceResult:
+        """Comprehensive cross-repo trace: implementation + ROUTES_TO + CALLS."""
+        records = self._client.run(
+            _TRACE_CROSS_REPO_FULL_CYPHER,
             {"uri": uri},
         )
         return TraceResult(records)

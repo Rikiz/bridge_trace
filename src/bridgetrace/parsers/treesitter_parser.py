@@ -41,25 +41,25 @@ _LANG_NAME_MAP: dict[str, str] = {
     ".java": "java",
 }
 
-_HTTP_METHOD_NAMES: frozenset[str] = frozenset(
-    {
-        "getForObject",
-        "postForObject",
-        "putForObject",
-        "deleteForObject",
-        "exchange",
-        "execute",
-        "get",
-        "post",
-        "put",
-        "delete",
-        "patch",
-        "head",
-        "options",
-        "fetch",
-        "request",
-    }
-)
+_CALL_NODE_TYPES: dict[str, list[str]] = {
+    "python": ["call"],
+    "java": ["method_invocation"],
+    "typescript": ["call_expression"],
+    "tsx": ["call_expression"],
+}
+
+_HTTP_CLIENT_METHODS: dict[str, str] = {
+    "getforobject": "GET",
+    "postforobject": "POST",
+    "putforobject": "PUT",
+    "deleteforobject": "DELETE",
+    "exchange": "GET",
+    "execute": "GET",
+    "fetch": "GET",
+    "request": "GET",
+}
+
+_SIMPLE_HTTP_METHODS = ("get", "post", "put", "delete", "patch", "head", "options")
 
 
 def _get_language_name(path: Path) -> str | None:
@@ -78,6 +78,20 @@ def _find_nodes_by_type(root: Node, type_name: str) -> list[Node]:
 
     def _walk(node: Node) -> None:
         if node.type == type_name:
+            results.append(node)
+        for child in node.children:
+            _walk(child)
+
+    _walk(root)
+    return results
+
+
+def _find_nodes_by_types(root: Node, type_names: set[str]) -> list[Node]:
+    """Walk the tree and collect all nodes matching any of the given types."""
+    results: list[Node] = []
+
+    def _walk(node: Node) -> None:
+        if node.type in type_names:
             results.append(node)
         for child in node.children:
             _walk(child)
@@ -157,11 +171,7 @@ class TreeSitterParser(BaseParser):
         impl_uris: set[str],
         http_call_uris: set[str],
     ) -> list[URIMatch]:
-        """Extract string literals that match the URI path pattern.
-
-        Skips URIs already captured by endpoint_impls or http_calls to avoid
-        duplicates. Assigns role based on context.
-        """
+        """Extract string literals that match the URI path pattern."""
         string_nodes = _find_nodes_by_type(root, "string")
         matches: list[URIMatch] = []
         for node in string_nodes:
@@ -209,7 +219,8 @@ class TreeSitterParser(BaseParser):
         func_by_name: dict[str, tuple[str, int]],
     ) -> list[CallEdge]:
         """Extract call relationships. Same-file calls are internal, others are external."""
-        call_nodes = _find_nodes_by_type(root, "call")
+        call_types = set(_CALL_NODE_TYPES.get(lang, ["call"]))
+        call_nodes = _find_nodes_by_types(root, call_types)
         results: list[CallEdge] = []
 
         for node in call_nodes:
@@ -265,21 +276,16 @@ class TreeSitterParser(BaseParser):
     def _extract_http_calls(
         self, root: Node, source: bytes, file_path: str, lang: str
     ) -> list[HttpCall]:
-        """Extract HTTP client calls that target URI endpoints.
-
-        Detects patterns like:
-          Java:   restTemplate.getForObject("/api/v1/users", ...)
-          Python: requests.get("/api/v1/users")
-          TS:     axios.get("/api/v1/users")
-        """
-        call_nodes = _find_nodes_by_type(root, "call")
+        """Extract HTTP client calls that target URI endpoints."""
+        call_types = set(_CALL_NODE_TYPES.get(lang, ["call"]))
+        call_nodes = _find_nodes_by_types(root, call_types)
         results: list[HttpCall] = []
 
         for node in call_nodes:
             callee_name = self._extract_callee_name(node, source, lang)
             if callee_name is None:
                 continue
-            method_name = self._normalize_http_method(callee_name)
+            method_name = _normalize_http_method(callee_name)
             if method_name is None:
                 continue
 
@@ -313,6 +319,10 @@ class TreeSitterParser(BaseParser):
             for child in func_node.children:
                 if child.type in ("annotation", "marker_annotation", "modifier"):
                     search_nodes.append(child)
+                elif child.type == "modifiers":
+                    for mod_child in child.children:
+                        if mod_child.type in ("annotation", "marker_annotation"):
+                            search_nodes.append(mod_child)
         elif lang == "python":
             parent = func_node.parent
             if parent is not None and parent.type == "decorated_definition":
@@ -342,27 +352,6 @@ class TreeSitterParser(BaseParser):
                         uris.append(cleaned)
 
         return uris
-
-    @staticmethod
-    def _normalize_http_method(callee_name: str) -> str | None:
-        """Extract the HTTP method from a callee name, if it is an HTTP client call."""
-        lower = callee_name.lower()
-
-        if lower in ("fetch", "request"):
-            return "GET"
-
-        for method in ("get", "post", "put", "delete", "patch", "head", "options"):
-            if lower == method or lower.endswith("." + method):
-                return method.upper()
-
-        for prefix in ("getfor", "postfor", "putfor", "deletefor"):
-            if lower.startswith(prefix):
-                return prefix[:-3].upper()
-
-        if lower == "exchange" or lower == "execute":
-            return "GET"
-
-        return None
 
     @staticmethod
     def _find_uri_in_call_args(node: Node, source: bytes) -> str | None:
@@ -409,6 +398,17 @@ class TreeSitterParser(BaseParser):
     @staticmethod
     def _extract_callee_name(node: Node, source: bytes, lang: str) -> str | None:
         """Extract the callee name from a call expression node."""
+        # Java method_invocation uses "name" field for the method identifier
+        if lang == "java":
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                obj_node = node.child_by_field_name("object")
+                method = _node_text(name_node, source)
+                if obj_node is not None:
+                    obj = _node_text(obj_node, source)
+                    return f"{obj}.{method}"
+                return method
+
         func_node = node.child_by_field_name("function")
         if func_node is not None:
             return _node_text(func_node, source)
@@ -443,3 +443,20 @@ class TreeSitterParser(BaseParser):
                     return (name, line)
             current = current.parent
         return None
+
+
+def _normalize_http_method(callee_name: str) -> str | None:
+    """Extract the HTTP method from a callee name, if it is an HTTP client call."""
+    if "." in callee_name:
+        last_segment = callee_name.rsplit(".", 1)[-1].lower()
+    else:
+        last_segment = callee_name.lower()
+
+    if last_segment in _HTTP_CLIENT_METHODS:
+        return _HTTP_CLIENT_METHODS[last_segment]
+
+    for method in _SIMPLE_HTTP_METHODS:
+        if last_segment == method:
+            return method.upper()
+
+    return None

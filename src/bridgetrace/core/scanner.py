@@ -35,7 +35,7 @@ _SCAN_EXTENSIONS: set[str] = {
     ".class",
 }
 
-_PARAM_RE = re.compile(r"\{[^}]*\}")
+_PARAM_RE = re.compile(r"\$\{[^}]*\}|\{[^}]*\}")
 
 
 class Scanner:
