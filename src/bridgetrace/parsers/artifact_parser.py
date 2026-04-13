@@ -11,11 +11,10 @@ from pathlib import Path
 
 from bridgetrace.models.graph import ParseResult, URIMatch
 from bridgetrace.parsers.base import BaseParser
+from bridgetrace.parsers.json_parser import URI_PATH_RE
 from bridgetrace.utils import normalize_path
 
-_ANNOTATION_PATH_RE = re.compile(
-    r'"(\/(?:[\w\-\.]+\/)+[\w\-\.]*)"'
-)  # same pattern as URI_PATH_RE but quoted
+_QUOTED_STRING_RE = re.compile(r'"(\/[^"]+)"')
 
 
 class ArtifactParser(BaseParser):
@@ -51,8 +50,10 @@ class ArtifactParser(BaseParser):
         for line in result.stdout.splitlines():
             if "RuntimeVisibleAnnotations" not in line and "@" not in line:
                 continue
-            for m in _ANNOTATION_PATH_RE.finditer(line):
+            for m in _QUOTED_STRING_RE.finditer(line):
                 uri = m.group(1)
+                if not URI_PATH_RE.match(uri):
+                    continue
                 if uri not in seen:
                     seen.add(uri)
                     matches.append(

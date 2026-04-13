@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Union
 
 
-def normalize_path(path: Union[str, Path], strict: bool = False) -> str:
+def normalize_path(path: str | Path, strict: bool = False) -> str:
     """Convert any absolute path to POSIX style for consistent IDs across platforms.
 
     Args:
@@ -17,14 +16,10 @@ def normalize_path(path: Union[str, Path], strict: bool = False) -> str:
     Returns:
         POSIX-style path string (forward slashes)
     """
-    # Convert to string and replace backslashes with forward slashes
     path_str = str(path)
 
-    # First, normalize separators
     normalized = path_str.replace("\\", "/")
 
-    # Check if it looks like a Windows absolute path (e.g., C:/Users)
-    # Pattern: A:/ or A:\ (already normalized to A:/)
     is_windows_abs = (
         len(normalized) >= 3
         and normalized[0].isalpha()
@@ -33,21 +28,20 @@ def normalize_path(path: Union[str, Path], strict: bool = False) -> str:
     )
 
     if is_windows_abs:
-        # Windows absolute path: keep as-is (already normalized separators)
-        # No resolution needed as it's already absolute
+        if len(normalized) > 260 and os.name == "nt":
+            normalized = "//?/" + normalized
         return normalized
 
-    # For other paths, try to resolve to absolute path if possible
     try:
         p = Path(normalized)
-        # For relative paths, resolve() will make them absolute relative to cwd
         resolved = p.resolve()
-        return resolved.as_posix()
+        result = resolved.as_posix()
+        if len(result) > 260 and os.name == "nt" and result[1] == ":":
+            result = "//?/" + result
+        return result
     except (OSError, RuntimeError):
-        # Resolution failed (e.g., path contains invalid characters, symlink loop)
         if strict:
             raise
-        # Return with normalized separators
         return normalized
 
 
@@ -62,9 +56,7 @@ def is_path_like(text: str) -> bool:
     if "\\" in text or "/" in text:
         return True
     # Check for common path patterns
-    if text.startswith("./") or text.startswith("../") or text.startswith("~/"):
-        return True
-    return False
+    return bool(text.startswith("./") or text.startswith("../") or text.startswith("~/"))
 
 
 def sanitize_for_id(text: str) -> str:

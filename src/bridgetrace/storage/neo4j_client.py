@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
-from neo4j import GraphDatabase, Driver
+from neo4j import Driver, GraphDatabase
 
 from bridgetrace.config import settings
-from bridgetrace.models.graph import GraphNode, GraphEdge
+from bridgetrace.models.graph import GraphEdge, GraphNode
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,28 @@ class Neo4jClient:
             for stmt in SCHEMA_CONSTRAINTS + SCHEMA_INDEXES:
                 session.run(stmt)
         logger.info("Neo4j schema bootstrapped successfully")
+
+    def clean_group(self, group_name: str) -> int:
+        """Delete all graph data associated with the given group.
+
+        Returns the number of nodes deleted.
+        """
+        group_id = f"group:{group_name}"
+        with self.driver.session(database=self._database) as session:
+            result = session.run(
+                """
+                MATCH (g:Group {id: $group_id})
+                OPTIONAL MATCH (g)-[:CONTAINS*0..4]->(descendant)
+                DETACH DELETE descendant
+                DETACH DELETE g
+                RETURN count(descendant) AS deleted
+                """,
+                group_id=group_id,
+            )
+            record = result.single()
+            deleted = record["deleted"] if record else 0
+        logger.info("Cleaned group '%s': %d nodes deleted", group_name, deleted)
+        return deleted
 
     def run(self, cypher: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Execute an arbitrary Cypher query and return records."""

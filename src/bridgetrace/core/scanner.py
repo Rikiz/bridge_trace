@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import pathspec
 
@@ -281,11 +282,8 @@ class Scanner:
                         caller_func_key = hc.caller
                         caller_short = caller_func_key.rsplit("::", 1)[-1].rsplit(":", 1)[0]
                         ep_id_to_func_name[target_ep_id] = caller_short
-                        if target_ep_id in ep_id_to_role:
-                            if ep_id_to_role[target_ep_id] == "reference":
-                                pass
-                        else:
-                            ep_id_to_role[target_ep_id] = "reference"
+                    if target_ep_id not in ep_id_to_role:
+                        ep_id_to_role[target_ep_id] = "reference"
 
         # ── Phase 3: IMPLEMENTS / IMPLEMENTED_BY / DEFINED_IN ─────────
         seen_impl_edges: set[str] = set()
@@ -346,22 +344,53 @@ class Scanner:
             if ep_props.get("role") == "implementation"
         ]
 
+        impl_suffix_index: dict[str, list[tuple[str, str]]] = {}
+        for impl_ep_id, impl_uri in implementation_eps:
+            norm_impl = _PARAM_RE.sub("{}", impl_uri)
+            impl_parts = tuple(p for p in norm_impl.split("/") if p)
+            if len(impl_parts) >= 2:
+                key = "/".join(impl_parts)
+                impl_suffix_index.setdefault(key, []).append((impl_ep_id, impl_uri))
+
         seen_routes_edges: set[str] = set()
         for decl_ep_id, decl_uri in declaration_eps:
-            for impl_ep_id, impl_uri in implementation_eps:
-                if _uri_suffix_match(decl_uri, impl_uri):
-                    edge_key = f"{decl_ep_id}->ROUTES_TO->{impl_ep_id}"
-                    if edge_key not in seen_routes_edges:
-                        seen_routes_edges.add(edge_key)
-                        edges.append(
-                            GraphEdge(
-                                rel_type="ROUTES_TO",
-                                from_label="Endpoint",
-                                from_id=decl_ep_id,
-                                to_label="Endpoint",
-                                to_id=impl_ep_id,
+            norm_decl = _PARAM_RE.sub("{}", decl_uri)
+            decl_parts = [p for p in norm_decl.split("/") if p]
+            matched = False
+            for suffix_len in range(min(len(decl_parts), 8), 1, -1):
+                suffix_key = "/".join(decl_parts[-suffix_len:])
+                if suffix_key in impl_suffix_index:
+                    for impl_ep_id, impl_uri in impl_suffix_index[suffix_key]:
+                        if _uri_suffix_match(decl_uri, impl_uri):
+                            edge_key = f"{decl_ep_id}->ROUTES_TO->{impl_ep_id}"
+                            if edge_key not in seen_routes_edges:
+                                seen_routes_edges.add(edge_key)
+                                edges.append(
+                                    GraphEdge(
+                                        rel_type="ROUTES_TO",
+                                        from_label="Endpoint",
+                                        from_id=decl_ep_id,
+                                        to_label="Endpoint",
+                                        to_id=impl_ep_id,
+                                    )
+                                )
+                    matched = True
+                    break
+            if not matched:
+                for impl_ep_id, impl_uri in implementation_eps:
+                    if _uri_suffix_match(decl_uri, impl_uri):
+                        edge_key = f"{decl_ep_id}->ROUTES_TO->{impl_ep_id}"
+                        if edge_key not in seen_routes_edges:
+                            seen_routes_edges.add(edge_key)
+                            edges.append(
+                                GraphEdge(
+                                    rel_type="ROUTES_TO",
+                                    from_label="Endpoint",
+                                    from_id=decl_ep_id,
+                                    to_label="Endpoint",
+                                    to_id=impl_ep_id,
+                                )
                             )
-                        )
 
         # ── Phase 4: Endpoint CALLS Endpoint (derived) ───────────────
         seen_ep_call_edges: set[str] = set()
@@ -434,7 +463,7 @@ class Scanner:
                         )
 
         # Enrich Endpoint nodes with final role/function_name
-        for i, node in enumerate(nodes):
+        for _i, node in enumerate(nodes):
             if node.label != "Endpoint":
                 continue
             ep_id = node.properties["id"]
@@ -446,23 +475,73 @@ class Scanner:
         return nodes, edges
 
     def _discover_files(self, roots: Sequence[Path]) -> list[Path]:
-        """Walk file trees, optionally respecting .gitignore."""
+        """Walk file trees, optionally respecting nested .gitignore files."""
         files: list[Path] = []
         for root in roots:
             root = root.resolve()
-            gitignore_spec = self._load_gitignore(root) if not self._ignore_gitignore else None
-
-            for path in root.rglob("*"):
-                if not path.is_file():
-                    continue
-                if path.suffix not in _SCAN_EXTENSIONS:
-                    continue
-                if gitignore_spec is not None:
-                    rel = path.relative_to(root)
-                    if gitignore_spec.match_file(str(rel)):
-                        continue
-                files.append(path)
+            if self._ignore_gitignore:
+                for path in root.rglob("*"):
+                    if path.is_file() and path.suffix in _SCAN_EXTENSIONS:
+                        files.append(path)
+            else:
+                files.extend(self._walk_with_gitignore(root))
         return files
+
+    def _walk_with_gitignore(self, root: Path) -> list[Path]:
+        """Walk a directory tree respecting nested .gitignore files."""
+        files: list[Path] = []
+        spec_stack: list[tuple[str, pathspec.PathSpec]] = []
+
+        root_spec = self._load_gitignore(root)
+        if root_spec is not None:
+            spec_stack.append(("", root_spec))
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = os.path.relpath(dirpath, root)
+
+            gi_path = os.path.join(dirpath, ".gitignore")
+            if os.path.isfile(gi_path):
+                lines = Path(gi_path).read_text(encoding="utf-8").splitlines()
+                dir_spec = pathspec.PathSpec.from_lines("gitwildmatch", lines)
+                spec_stack.append((rel_dir, dir_spec))
+
+            for fname in filenames:
+                fpath = Path(dirpath) / fname
+                if fpath.suffix not in _SCAN_EXTENSIONS:
+                    continue
+                rel = os.path.relpath(str(fpath), str(root))
+                if self._is_ignored(rel, spec_stack):
+                    continue
+                files.append(fpath)
+
+            removed_dirs: list[str] = []
+            for dname in dirnames:
+                d_rel = os.path.relpath(os.path.join(dirpath, dname), str(root))
+                if self._is_ignored(d_rel, spec_stack, is_dir=True):
+                    removed_dirs.append(dname)
+            for d in removed_dirs:
+                dirnames.remove(d)
+
+            if os.path.normpath(rel_dir) not in [os.path.normpath(s[0]) for s in spec_stack]:
+                pass
+
+        return files
+
+    @staticmethod
+    def _is_ignored(
+        rel_path: str,
+        spec_stack: list[tuple[str, pathspec.PathSpec]],
+        is_dir: bool = False,
+    ) -> bool:
+        """Check if a relative path is ignored by any gitignore in the stack."""
+        for base_dir, spec in spec_stack:
+            if base_dir and not rel_path.startswith(base_dir.replace(os.sep, "/") + "/"):
+                continue
+            if spec.match_file(rel_path):
+                return True
+            if is_dir and spec.match_file(rel_path + "/"):
+                return True
+        return False
 
     def _parse_file(self, path: Path) -> ParseResult | None:
         """Dispatch a file to the first compatible parser."""
@@ -545,9 +624,8 @@ def _infer_repo_name_fallback(normalized_posix_path: str) -> str:
     for i in range(len(parts) - 1, -1, -1):
         if parts[i].endswith(".git"):
             return parts[i].removesuffix(".git")
-        if parts[i] in ("src", "lib", "pkg", "app"):
-            if i > 0:
-                return parts[i - 1]
+        if parts[i] in ("src", "lib", "pkg", "app") and i > 0:
+            return parts[i - 1]
     return parts[-2] if len(parts) >= 2 else "unknown"
 
 

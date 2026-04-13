@@ -425,10 +425,15 @@ class TreeSitterParser(BaseParser):
     @staticmethod
     def _find_enclosing_function(node: Node, source: bytes, lang: str) -> tuple[str, int] | None:
         """Walk up the tree to find the enclosing function definition."""
-        func_type = TreeSitterParser._function_node_type(lang)
+        func_types: set[str]
+        if lang == "java":
+            func_types = {"method_declaration", "constructor_declaration", "lambda_expression"}
+        else:
+            func_types = {TreeSitterParser._function_node_type(lang)}
+
         current = node.parent
         while current is not None:
-            if current.type == func_type:
+            if current.type in func_types:
                 name_node = current.child_by_field_name("name")
                 name = None
                 if name_node is not None:

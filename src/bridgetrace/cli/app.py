@@ -39,6 +39,9 @@ def scan(
     bootstrap: bool = typer.Option(
         False, "--bootstrap", help="Bootstrap Neo4j schema before scan."
     ),
+    clean: bool = typer.Option(
+        False, "--clean", help="Delete existing graph data for this group before scanning."
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output structured JSON."),
 ) -> None:
     """Execute a full scan on all paths in the given group."""
@@ -61,6 +64,10 @@ def scan(
     with Neo4jClient() as client:
         if bootstrap:
             client.bootstrap_schema()
+
+        if clean:
+            deleted = client.clean_group(group)
+            console.print(f"[yellow]Cleaned {deleted} existing nodes for group '{group}'[/yellow]")
 
         client.batch_merge_nodes(nodes)
         client.batch_merge_edges(edges)
@@ -91,6 +98,9 @@ def trace(
     ),
     json_output: bool = typer.Option(False, "--json", help="Output structured JSON."),
     impl: bool = typer.Option(False, "--impl", help="Trace to backend implementation."),
+    cross_repo: bool = typer.Option(
+        False, "--cross-repo", help="Trace cross-repo routing (gateway → backend)."
+    ),
 ) -> None:
     """Trace the full topology chain for a given URI."""
     _setup_logging()
@@ -99,8 +109,46 @@ def trace(
         engine = TraceEngine(client)
         if impl and group:
             result = engine.trace_uri_to_implementation(uri, group)
+        elif cross_repo:
+            result = engine.trace_cross_repo(uri)
         else:
             result = engine.trace_uri(uri, group)
+
+    if json_output:
+        console.print_json(json.dumps(result.to_dict_list()))
+    else:
+        console.print(result.format_text())
+
+
+@app.command("trace-endpoint-calls")
+def trace_endpoint_calls(
+    uri: str = typer.Argument(..., help="URI path of the source endpoint."),
+    json_output: bool = typer.Option(False, "--json", help="Output structured JSON."),
+) -> None:
+    """Trace which other endpoints are called by the given endpoint."""
+    _setup_logging()
+
+    with Neo4jClient() as client:
+        engine = TraceEngine(client)
+        result = engine.trace_endpoint_calls(uri)
+
+    if json_output:
+        console.print_json(json.dumps(result.to_dict_list()))
+    else:
+        console.print(result.format_text())
+
+
+@app.command("trace-consumers")
+def trace_consumers(
+    uri: str = typer.Argument(..., help="URI path of the endpoint."),
+    json_output: bool = typer.Option(False, "--json", help="Output structured JSON."),
+) -> None:
+    """Find which functions consume the given endpoint via HTTP calls."""
+    _setup_logging()
+
+    with Neo4jClient() as client:
+        engine = TraceEngine(client)
+        result = engine.trace_consumers(uri)
 
     if json_output:
         console.print_json(json.dumps(result.to_dict_list()))
@@ -111,7 +159,7 @@ def trace(
 @group_app.command("add")
 def group_add(
     name: str = typer.Argument(..., help="Group name."),
-    paths: list[str] = typer.Argument(..., help="Repository paths to bind."),
+    paths: list[str] = typer.Argument(..., help="Repository paths to bind."),  # noqa: B008
 ) -> None:
     """Add or update a logical group with the given paths."""
     _setup_logging()
