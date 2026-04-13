@@ -61,15 +61,29 @@ class Scanner:
         return results
 
     def build_graph_entities(
-        self, results: list[ParseResult], group_name: str
+        self, results: list[ParseResult], group_name: str, group_roots: Sequence[Path] = ()
     ) -> tuple[list[GraphNode], list[GraphEdge]]:
-        """Convert parse results into Neo4j-ready nodes and edges."""
+        """Convert parse results into Neo4j-ready nodes and edges.
+
+        Args:
+            results: Parse results from scan_paths.
+            group_name: Logical group name.
+            group_roots: The repository root paths bound to this group.
+                         Used for longest-prefix matching to determine repo names.
+        """
         nodes: list[GraphNode] = []
         edges: list[GraphEdge] = []
         seen_repo_ids: set[str] = set()
         seen_file_ids: set[str] = set()
         seen_endpoint_edges: set[str] = set()
         seen_function_edges: set[str] = set()
+
+        # Build sorted normalized roots for longest-prefix matching (longest first)
+        sorted_roots = sorted(
+            [normalize_path(r) for r in group_roots],
+            key=len,
+            reverse=True,
+        )
 
         group_id = f"group:{group_name}"
         nodes.append(GraphNode(label="Group", properties={"id": group_id, "name": group_name}))
@@ -78,7 +92,7 @@ class Scanner:
             fpath = normalize_path(result.file_path)
             file_id = f"file:{_stable_id(fpath)}"
 
-            repo_name = self._infer_repo_name(fpath)
+            repo_name = _match_repo(fpath, sorted_roots)
             repo_id = f"repo:{repo_name}"
 
             if repo_id not in seen_repo_ids:
@@ -217,18 +231,34 @@ class Scanner:
             return pathspec.PathSpec.from_lines("gitwildmatch", lines)
         return None
 
-    @staticmethod
-    def _infer_repo_name(normalized_posix_path: str) -> str:
-        """Best-effort inference of the repository name from a normalized POSIX path."""
-        # normalized_posix_path is always POSIX (forward slashes, e.g. C:/Users/project/src/main.java)
-        parts = [p for p in normalized_posix_path.split("/") if p]
-        for i in range(len(parts) - 1, -1, -1):
-            if parts[i].endswith(".git"):
-                return parts[i].removesuffix(".git")
-            if parts[i] in ("src", "lib", "pkg", "app"):
-                if i > 0:
-                    return parts[i - 1]
-        return parts[-2] if len(parts) >= 2 else "unknown"
+
+def _match_repo(fpath: str, sorted_roots: list[str]) -> str:
+    """Determine repo name by longest-prefix matching against group root paths.
+
+    Args:
+        fpath: Normalized POSIX file path.
+        sorted_roots: Normalized POSIX root paths, sorted longest-first.
+
+    Returns:
+        Repo name derived from the matching root's last path segment.
+    """
+    for root in sorted_roots:
+        if fpath.startswith(root):
+            segment = root.rstrip("/").rsplit("/", 1)[-1]
+            return segment
+    return _infer_repo_name_fallback(fpath)
+
+
+def _infer_repo_name_fallback(normalized_posix_path: str) -> str:
+    """Fallback heuristic when no root path matches a file."""
+    parts = [p for p in normalized_posix_path.split("/") if p]
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i].endswith(".git"):
+            return parts[i].removesuffix(".git")
+        if parts[i] in ("src", "lib", "pkg", "app"):
+            if i > 0:
+                return parts[i - 1]
+    return parts[-2] if len(parts) >= 2 else "unknown"
 
 
 def _stable_id(text: str) -> str:

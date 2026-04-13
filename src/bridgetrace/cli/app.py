@@ -56,7 +56,7 @@ def scan(
     scanner = Scanner()
     results = scanner.scan_paths(paths)
 
-    nodes, edges = scanner.build_graph_entities(results, group)
+    nodes, edges = scanner.build_graph_entities(results, group, grp.paths)
 
     with Neo4jClient() as client:
         if bootstrap:
