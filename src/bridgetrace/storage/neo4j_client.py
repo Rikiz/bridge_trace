@@ -104,12 +104,14 @@ class Neo4jClient:
             return
         bs = batch_size or settings.scan_batch_size
 
-        by_rel: dict[str, list[GraphEdge]] = {}
+        # Group edges by (rel_type, from_label, to_label) for efficient matching
+        by_key: dict[tuple[str, str, str], list[GraphEdge]] = {}
         for e in edges:
-            by_rel.setdefault(e.rel_type, []).append(e)
+            key = (e.rel_type, e.from_label, e.to_label)
+            by_key.setdefault(key, []).append(e)
 
         with self.driver.session(database=self._database) as session:
-            for rel, group in by_rel.items():
+            for (rel, from_label, to_label), group in by_key.items():
                 for i in range(0, len(group), bs):
                     chunk = group[i : i + bs]
                     rows = [
@@ -123,11 +125,11 @@ class Neo4jClient:
                     session.run(
                         f"""
                         UNWIND $rows AS row
-                        MATCH (a {{id: row.from_id}})
-                        MATCH (b {{id: row.to_id}})
+                        MATCH (a:{from_label} {{id: row.from_id}})
+                        MATCH (b:{to_label} {{id: row.to_id}})
                         MERGE (a)-[r:{rel}]->(b)
                         SET r += row.props
                         """,
                         rows=rows,
                     )
-                logger.info("Merged %d %s edges", len(group), rel)
+                logger.info("Merged %d %s edges (%s->%s)", len(group), rel, from_label, to_label)

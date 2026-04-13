@@ -10,25 +10,25 @@ from bridgetrace.storage.neo4j_client import Neo4jClient
 logger = logging.getLogger(__name__)
 
 _TRACE_CYPHER = """
-MATCH path = (caller:Function)-[:CALLS_INTERNAL|CALLS_EXTERNAL*1..6]->(mid:Function)
-             <-[:CONTAINS*1..3]-(endpoint:Endpoint {uri: $uri})
+MATCH (ep:Endpoint {uri: $uri})<-[:CONTAINS]-(file:File)-[:CONTAINS]->(callee:Function)
+MATCH path = (caller:Function)-[:CALLS_INTERNAL|CALLS_EXTERNAL*1..10]->(callee)
 RETURN path
 """
 
 _TRACE_FULL_CYPHER = """
-MATCH (caller:Function)-[:CALLS_INTERNAL|CALLS_EXTERNAL*1..6]->(callee:Function),
-      (callee)<-[:CONTAINS*1..3]-(endpoint:Endpoint {uri: $uri}),
-      (file:File)-[:CONTAINS]->(caller),
-      (repo:Repo)-[:CONTAINS]->(file),
-      (group:Group)-[:CONTAINS]->(repo)
-WHERE group.name = $group
-RETURN caller.name AS caller_name,
+MATCH (ep:Endpoint {uri: $uri})<-[:CONTAINS]-(file:File)-[:CONTAINS]->(callee:Function)
+MATCH (caller:Function)-[:CALLS_INTERNAL|CALLS_EXTERNAL*1..10]->(callee)
+MATCH (caller_file:File)-[:CONTAINS]->(caller)
+MATCH (caller_repo:Repo)-[:CONTAINS]->(caller_file)
+MATCH (caller_group:Group)-[:CONTAINS]->(caller_repo)
+WHERE caller_group.name = $group
+RETURN DISTINCT caller.name AS caller_name,
        caller.file_path AS caller_file,
        caller.line AS caller_line,
        callee.name AS callee_name,
        callee.file_path AS callee_file,
-       labels(endpoint) AS endpoint_labels,
-       endpoint.uri AS endpoint_uri
+       ep.uri AS endpoint_uri,
+       caller_group.name AS group_name
 """
 
 _TRACE_URI_TO_IMPL_CYPHER = """
