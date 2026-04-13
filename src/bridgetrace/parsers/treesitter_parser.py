@@ -96,7 +96,7 @@ class TreeSitterParser(BaseParser):
         source = path.read_bytes()
         parser = self._get_parser(path.suffix)
         tree = parser.parse(source)
-        root = tree.rootNode
+        root = tree.root_node
 
         uris = self._extract_uri_literals(root, source, normalized_path)
         functions = self._extract_functions(root, source, normalized_path, lang)
