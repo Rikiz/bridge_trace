@@ -1,11 +1,10 @@
 """Tree-sitter based semantic parser for Python, TypeScript, and Java.
 
 Extracts string literals, function definitions (with line numbers & snippets),
-and internal call graphs.
+internal and external call graphs, and endpoint-implementation mappings.
 
 Uses the new tree-sitter 0.22+ API with individual language packages
-(tree-sitter-python, tree-sitter-java, tree-sitter-typescript) instead
-of the incompatible tree-sitter-languages bundle.
+(tree-sitter-python, tree-sitter-java, tree-sitter-typescript).
 """
 
 from __future__ import annotations
@@ -18,7 +17,13 @@ import tree_sitter_python as tspython
 import tree_sitter_typescript as tstypescript
 from tree_sitter import Language, Node, Parser
 
-from bridgetrace.models.graph import CallEdge, FunctionDef, ParseResult, URIMatch
+from bridgetrace.models.graph import (
+    CallEdge,
+    EndpointImpl,
+    FunctionDef,
+    ParseResult,
+    URIMatch,
+)
 from bridgetrace.parsers.base import BaseParser
 from bridgetrace.parsers.json_parser import URI_PATH_RE
 from bridgetrace.utils import normalize_path
@@ -74,7 +79,6 @@ class TreeSitterParser(BaseParser):
         """Lazily initialise a tree-sitter parser for the given file extension."""
         if ext not in self._parsers:
             entry = _LANG_ENTRY_MAP[ext]
-            # tree-sitter-typescript exposes language() and tsx_language()
             if ext == ".ts":
                 lang = Language(entry.language_typescript())
             elif ext == ".tsx":
@@ -106,12 +110,14 @@ class TreeSitterParser(BaseParser):
             func_by_name[func.name] = (func.name, func.line)
 
         calls = self._extract_calls(root, source, normalized_path, lang, func_by_name)
+        endpoint_impls = self._extract_endpoint_impls(root, source, normalized_path, lang)
 
         return ParseResult(
             file_path=normalized_path,
             uris=uris,
             functions=functions,
             calls=calls,
+            endpoint_impls=endpoint_impls,
         )
 
     def _extract_uri_literals(self, root: Node, source: bytes, file_path: str) -> list[URIMatch]:
@@ -156,9 +162,8 @@ class TreeSitterParser(BaseParser):
         lang: str,
         func_by_name: dict[str, tuple[str, int]],
     ) -> list[CallEdge]:
-        """Extract internal call relationships (caller -> callee)."""
-        call_type = "call"
-        call_nodes = _find_nodes_by_type(root, call_type)
+        """Extract call relationships. Same-file calls are internal, others are external."""
+        call_nodes = _find_nodes_by_type(root, "call")
         results: list[CallEdge] = []
 
         for node in call_nodes:
@@ -182,7 +187,79 @@ class TreeSitterParser(BaseParser):
                         line=node.start_point[0] + 1,
                     )
                 )
+            else:
+                results.append(
+                    CallEdge(
+                        caller=caller_key,
+                        callee=callee_name,
+                        call_type="external",
+                        line=node.start_point[0] + 1,
+                    )
+                )
         return results
+
+    def _extract_endpoint_impls(
+        self, root: Node, source: bytes, file_path: str, lang: str
+    ) -> list[EndpointImpl]:
+        """Extract endpoint-implementation mappings from annotations/decorators."""
+        func_type = self._function_node_type(lang)
+        func_nodes = _find_nodes_by_type(root, func_type)
+        results: list[EndpointImpl] = []
+
+        for func_node in func_nodes:
+            name = self._extract_function_name(func_node, source, lang)
+            if name is None:
+                continue
+            line = func_node.start_point[0] + 1
+            annotation_uris = self._find_annotation_uris(func_node, source, lang)
+            for uri in annotation_uris:
+                results.append(EndpointImpl(uri=uri, function_name=name, function_line=line))
+        return results
+
+    def _find_annotation_uris(self, func_node: Node, source: bytes, lang: str) -> list[str]:
+        """Find URI strings in annotations/decorators attached to a function."""
+        uris: list[str] = []
+        seen: set[str] = set()
+        search_nodes: list[Node] = []
+
+        if lang == "java":
+            for child in func_node.children:
+                if child.type in ("annotation", "marker_annotation", "modifier"):
+                    search_nodes.append(child)
+        elif lang == "python":
+            parent = func_node.parent
+            if parent is not None and parent.type == "decorated_definition":
+                for child in parent.children:
+                    if child.type == "decorator":
+                        search_nodes.append(child)
+        elif lang in ("typescript", "tsx"):
+            for child in func_node.children:
+                if child.type == "decorator":
+                    search_nodes.append(child)
+            parent = func_node.parent
+            if parent is not None:
+                for child in parent.children:
+                    if (
+                        child.type == "decorator"
+                        and child.start_point[0] < func_node.start_point[0]
+                    ):
+                        search_nodes.append(child)
+
+        for search_node in search_nodes:
+            for string_node in _find_nodes_by_type(search_node, "string"):
+                text = _node_text(string_node, source)
+                cleaned = text.strip("\"'`")
+                if URI_PATH_RE.match(cleaned) and cleaned not in seen:
+                    seen.add(cleaned)
+                    uris.append(cleaned)
+            for string_node in _find_nodes_by_type(search_node, "string_literal"):
+                text = _node_text(string_node, source)
+                cleaned = text.strip("\"'`")
+                if URI_PATH_RE.match(cleaned) and cleaned not in seen:
+                    seen.add(cleaned)
+                    uris.append(cleaned)
+
+        return uris
 
     @staticmethod
     def _function_node_type(lang: str) -> str:

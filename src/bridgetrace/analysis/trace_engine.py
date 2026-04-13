@@ -10,13 +10,13 @@ from bridgetrace.storage.neo4j_client import Neo4jClient
 logger = logging.getLogger(__name__)
 
 _TRACE_CYPHER = """
-MATCH (ep:Endpoint {uri: $uri})<-[:CONTAINS]-(file:File)-[:CONTAINS]->(callee:Function)
+MATCH (ep:Endpoint {uri: $uri})<-[:CONTAINS|DEFINED_IN]-(file:File)-[:CONTAINS]->(callee:Function)
 MATCH path = (caller:Function)-[:CALLS_INTERNAL|CALLS_EXTERNAL*1..10]->(callee)
 RETURN path
 """
 
 _TRACE_FULL_CYPHER = """
-MATCH (ep:Endpoint {uri: $uri})<-[:CONTAINS]-(file:File)-[:CONTAINS]->(callee:Function)
+MATCH (ep:Endpoint {uri: $uri})<-[:CONTAINS|DEFINED_IN]-(file:File)-[:CONTAINS]->(callee:Function)
 MATCH (caller:Function)-[:CALLS_INTERNAL|CALLS_EXTERNAL*1..10]->(callee)
 MATCH (caller_file:File)-[:CONTAINS]->(caller)
 MATCH (caller_repo:Repo)-[:CONTAINS]->(caller_file)
@@ -32,16 +32,20 @@ RETURN DISTINCT caller.name AS caller_name,
 """
 
 _TRACE_URI_TO_IMPL_CYPHER = """
-MATCH (ep:Endpoint {uri: $uri})<-[:CONTAINS*1..3]-(impl:Function),
-      (impl)<-[:IMPLEMENTS]-(controller:Function),
-      (group:Group)-[:CONTAINS*1..3]->(ep)
-WHERE group.name = $group
+MATCH (ep:Endpoint {uri: $uri})<-[:IMPLEMENTED_BY]-(impl:Function),
+      (ep)<-[:CONTAINS*1..3]-(group:Group {name: $group})
 RETURN ep.uri AS uri,
        impl.name AS impl_name,
        impl.file_path AS impl_file,
-       impl.line AS impl_line,
-       controller.name AS controller_name,
-       controller.file_path AS controller_file
+       impl.line AS impl_line
+"""
+
+_TRACE_ENDPOINT_CALLS_CYPHER = """
+MATCH (src:Endpoint {uri: $uri})-[:CALLS]->(dst:Endpoint)
+OPTIONAL MATCH (dst)<-[:IMPLEMENTED_BY]-(func:Function)
+RETURN dst.uri AS called_endpoint,
+       func.name AS implementing_function,
+       func.file_path AS function_file
 """
 
 
@@ -93,5 +97,13 @@ class TraceEngine:
         records = self._client.run(
             _TRACE_URI_TO_IMPL_CYPHER,
             {"uri": uri, "group": group},
+        )
+        return TraceResult(records)
+
+    def trace_endpoint_calls(self, uri: str) -> TraceResult:
+        """Trace which other endpoints are called by the given endpoint."""
+        records = self._client.run(
+            _TRACE_ENDPOINT_CALLS_CYPHER,
+            {"uri": uri},
         )
         return TraceResult(records)

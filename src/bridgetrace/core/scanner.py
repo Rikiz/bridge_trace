@@ -65,25 +65,40 @@ class Scanner:
     ) -> tuple[list[GraphNode], list[GraphEdge]]:
         """Convert parse results into Neo4j-ready nodes and edges.
 
-        Args:
-            results: Parse results from scan_paths.
-            group_name: Logical group name.
-            group_roots: The repository root paths bound to this group.
-                         Used for longest-prefix matching to determine repo names.
+        Uses a multi-phase approach:
+          Phase 1: Create all nodes and CONTAINS edges, build indexes
+          Phase 2: Create CALLS_INTERNAL / CALLS_EXTERNAL edges
+          Phase 3: Create IMPLEMENTS / IMPLEMENTED_BY / DEFINED_IN edges
+          Phase 4: Create Endpoint CALLS Endpoint edges (derived)
         """
         nodes: list[GraphNode] = []
         edges: list[GraphEdge] = []
-        seen_repo_ids: set[str] = set()
-        seen_file_ids: set[str] = set()
-        seen_endpoint_edges: set[str] = set()
-        seen_function_edges: set[str] = set()
 
-        # Build sorted normalized roots for longest-prefix matching (longest first)
         sorted_roots = sorted(
             [normalize_path(r) for r in group_roots],
             key=len,
             reverse=True,
         )
+
+        # ── Phase 1: Nodes + CONTAINS edges ──────────────────────────
+        seen_repo_ids: set[str] = set()
+        seen_file_ids: set[str] = set()
+        seen_endpoint_edges: set[str] = set()
+        seen_function_edges: set[str] = set()
+
+        # Indexes for later phases
+        # func_id by (file_path, func_name, func_line)
+        func_key_to_id: dict[str, str] = {}
+        # function short name → [(repo_name, func_id)] for external call resolution
+        func_name_to_ids: dict[str, list[tuple[str, str]]] = {}
+        # func_id → set of endpoint_ids it implements
+        func_id_to_ep_ids: dict[str, set[str]] = {}
+        # endpoint_id → set of func_ids that implement it
+        ep_id_to_func_ids: dict[str, set[str]] = {}
+        # endpoint_id → file_id
+        ep_id_to_file_id: dict[str, str] = {}
+        # uri → endpoint_id
+        uri_to_ep_id: dict[str, str] = {}
 
         group_id = f"group:{group_name}"
         nodes.append(GraphNode(label="Group", properties={"id": group_id, "name": group_name}))
@@ -91,7 +106,6 @@ class Scanner:
         for result in results:
             fpath = normalize_path(result.file_path)
             file_id = f"file:{_stable_id(fpath)}"
-
             repo_name = _match_repo(fpath, sorted_roots)
             repo_id = f"repo:{repo_name}"
 
@@ -125,10 +139,7 @@ class Scanner:
                 ep_id = f"endpoint:{_stable_id(uri_match.uri)}"
                 ep_edge_key = f"{file_id}->CONTAINS->{ep_id}"
                 nodes.append(
-                    GraphNode(
-                        label="Endpoint",
-                        properties={"id": ep_id, "uri": uri_match.uri},
-                    )
+                    GraphNode(label="Endpoint", properties={"id": ep_id, "uri": uri_match.uri})
                 )
                 if ep_edge_key not in seen_endpoint_edges:
                     seen_endpoint_edges.add(ep_edge_key)
@@ -141,9 +152,13 @@ class Scanner:
                             to_id=ep_id,
                         )
                     )
+                ep_id_to_file_id[ep_id] = file_id
+                uri_to_ep_id[uri_match.uri] = ep_id
 
             for func in result.functions:
-                func_id = f"func:{_stable_id(f'{fpath}::{func.name}:{func.line}')}"
+                func_key = f"{fpath}::{func.name}:{func.line}"
+                func_id = f"func:{_stable_id(func_key)}"
+                func_key_to_id[func_key] = func_id
                 func_edge_key = f"{file_id}->CONTAINS->{func_id}"
                 nodes.append(
                     GraphNode(
@@ -168,23 +183,124 @@ class Scanner:
                             to_id=func_id,
                         )
                     )
+                func_name_to_ids.setdefault(func.name, []).append((repo_name, func_id))
+
+            for impl in result.endpoint_impls:
+                func_key = f"{fpath}::{impl.function_name}:{impl.function_line}"
+                func_id = func_key_to_id.get(func_key, f"func:{_stable_id(func_key)}")
+                ep_id = f"endpoint:{_stable_id(impl.uri)}"
+                func_id_to_ep_ids.setdefault(func_id, set()).add(ep_id)
+                ep_id_to_func_ids.setdefault(ep_id, set()).add(func_id)
+
+        # ── Phase 2: Call edges (INTERNAL + EXTERNAL) ────────────────
+        for result in results:
+            fpath = normalize_path(result.file_path)
+            repo_name = _match_repo(fpath, sorted_roots)
 
             for call in result.calls:
-                caller_id = f"func:{_stable_id(call.caller)}"
-                callee_id = f"func:{_stable_id(call.callee)}"
-                call_type_rel = (
-                    "CALLS_INTERNAL" if call.call_type == "internal" else "CALLS_EXTERNAL"
-                )
+                if call.call_type == "internal":
+                    caller_id = f"func:{_stable_id(call.caller)}"
+                    callee_id = f"func:{_stable_id(call.callee)}"
+                    edges.append(
+                        GraphEdge(
+                            rel_type="CALLS_INTERNAL",
+                            from_label="Function",
+                            from_id=caller_id,
+                            to_label="Function",
+                            to_id=callee_id,
+                            properties={"line": call.line},
+                        )
+                    )
+                else:
+                    caller_id = f"func:{_stable_id(call.caller)}"
+                    callee_id = _resolve_external_callee(call.callee, repo_name, func_name_to_ids)
+                    if callee_id is not None:
+                        edges.append(
+                            GraphEdge(
+                                rel_type="CALLS_EXTERNAL",
+                                from_label="Function",
+                                from_id=caller_id,
+                                to_label="Function",
+                                to_id=callee_id,
+                                properties={"line": call.line},
+                            )
+                        )
+
+        # ── Phase 3: IMPLEMENTS / IMPLEMENTED_BY / DEFINED_IN ────────
+        seen_impl_edges: set[str] = set()
+
+        for func_id, ep_ids in func_id_to_ep_ids.items():
+            for ep_id in ep_ids:
+                edge_key = f"{func_id}->IMPLEMENTS->{ep_id}"
+                if edge_key not in seen_impl_edges:
+                    seen_impl_edges.add(edge_key)
+                    edges.append(
+                        GraphEdge(
+                            rel_type="IMPLEMENTS",
+                            from_label="Function",
+                            from_id=func_id,
+                            to_label="Endpoint",
+                            to_id=ep_id,
+                        )
+                    )
+
+        for ep_id, func_ids in ep_id_to_func_ids.items():
+            for func_id in func_ids:
+                edge_key = f"{ep_id}->IMPLEMENTED_BY->{func_id}"
+                if edge_key not in seen_impl_edges:
+                    seen_impl_edges.add(edge_key)
+                    edges.append(
+                        GraphEdge(
+                            rel_type="IMPLEMENTED_BY",
+                            from_label="Endpoint",
+                            from_id=ep_id,
+                            to_label="Function",
+                            to_id=func_id,
+                        )
+                    )
+
+        for ep_id, file_id in ep_id_to_file_id.items():
+            edge_key = f"{ep_id}->DEFINED_IN->{file_id}"
+            if edge_key not in seen_impl_edges:
+                seen_impl_edges.add(edge_key)
                 edges.append(
                     GraphEdge(
-                        rel_type=call_type_rel,
-                        from_label="Function",
-                        from_id=caller_id,
-                        to_label="Function",
-                        to_id=callee_id,
-                        properties={"line": call.line},
+                        rel_type="DEFINED_IN",
+                        from_label="Endpoint",
+                        from_id=ep_id,
+                        to_label="File",
+                        to_id=file_id,
                     )
                 )
+
+        # ── Phase 4: Endpoint CALLS Endpoint (derived) ───────────────
+        # If func A implements endpoint EA and func A calls func B
+        # which implements endpoint EB, then EA calls EB.
+        seen_ep_call_edges: set[str] = set()
+
+        for edge in edges:
+            if edge.rel_type not in ("CALLS_INTERNAL", "CALLS_EXTERNAL"):
+                continue
+            caller_func_id = edge.from_id
+            callee_func_id = edge.to_id
+            caller_eps = func_id_to_ep_ids.get(caller_func_id, set())
+            callee_eps = func_id_to_ep_ids.get(callee_func_id, set())
+            for src_ep in caller_eps:
+                for dst_ep in callee_eps:
+                    if src_ep == dst_ep:
+                        continue
+                    ep_call_key = f"{src_ep}->CALLS->{dst_ep}"
+                    if ep_call_key not in seen_ep_call_edges:
+                        seen_ep_call_edges.add(ep_call_key)
+                        edges.append(
+                            GraphEdge(
+                                rel_type="CALLS",
+                                from_label="Endpoint",
+                                from_id=src_ep,
+                                to_label="Endpoint",
+                                to_id=dst_ep,
+                            )
+                        )
 
         return nodes, edges
 
@@ -233,15 +349,7 @@ class Scanner:
 
 
 def _match_repo(fpath: str, sorted_roots: list[str]) -> str:
-    """Determine repo name by longest-prefix matching against group root paths.
-
-    Args:
-        fpath: Normalized POSIX file path.
-        sorted_roots: Normalized POSIX root paths, sorted longest-first.
-
-    Returns:
-        Repo name derived from the matching root's last path segment.
-    """
+    """Determine repo name by longest-prefix matching against group root paths."""
     for root in sorted_roots:
         if fpath.startswith(root):
             segment = root.rstrip("/").rsplit("/", 1)[-1]
@@ -261,16 +369,44 @@ def _infer_repo_name_fallback(normalized_posix_path: str) -> str:
     return parts[-2] if len(parts) >= 2 else "unknown"
 
 
-def _stable_id(text: str) -> str:
-    """Generate a deterministic short id from text.
+def _resolve_external_callee(
+    callee_name: str,
+    caller_repo: str,
+    func_name_to_ids: dict[str, list[tuple[str, str]]],
+) -> str | None:
+    """Resolve an external callee name to a func_id.
 
-    For pure file paths, normalize to POSIX first for cross-platform consistency.
-    For composite keys (e.g. "path::name:line"), the path component is already
-    normalized by the parser, so hash directly to avoid resolve() side effects.
+    Tries exact name first, then the last segment after '.'.
+    Prefers functions in the same repo, falls back to any repo.
     """
+    candidates = _lookup_callee(callee_name, caller_repo, func_name_to_ids)
+    if candidates is None and "." in callee_name:
+        short_name = callee_name.rsplit(".", 1)[-1]
+        candidates = _lookup_callee(short_name, caller_repo, func_name_to_ids)
+    return candidates
+
+
+def _lookup_callee(
+    name: str,
+    caller_repo: str,
+    func_name_to_ids: dict[str, list[tuple[str, str]]],
+) -> str | None:
+    """Look up a callee name, preferring same-repo matches."""
+    entries = func_name_to_ids.get(name)
+    if not entries:
+        return None
+
+    same_repo = [fid for repo, fid in entries if repo == caller_repo]
+    if len(same_repo) == 1:
+        return same_repo[0]
+    if len(entries) == 1:
+        return entries[0][1]
+    return None
+
+
+def _stable_id(text: str) -> str:
+    """Generate a deterministic short id from text."""
     if "::" in text:
-        # Composite key like "path::func_name:line" — path already normalized
         return hashlib.sha256(text.encode()).hexdigest()[:16]
-    # Pure path — normalize for cross-platform consistency
     normalized = sanitize_for_id(text)
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]

@@ -30,6 +30,14 @@ class CallEdge(BaseModel):
     line: int = 0
 
 
+class EndpointImpl(BaseModel):
+    """Maps an endpoint URI to the function that implements it."""
+
+    uri: str
+    function_name: str
+    function_line: int
+
+
 class ParseResult(BaseModel):
     """Aggregated result from a single file parse."""
 
@@ -37,6 +45,7 @@ class ParseResult(BaseModel):
     uris: list[URIMatch] = Field(default_factory=list)
     functions: list[FunctionDef] = Field(default_factory=list)
     calls: list[CallEdge] = Field(default_factory=list)
+    endpoint_impls: list[EndpointImpl] = Field(default_factory=list)
 
 
 class GraphNode(BaseModel):
