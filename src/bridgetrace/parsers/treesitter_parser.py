@@ -1,10 +1,8 @@
 """Tree-sitter based semantic parser for Python, TypeScript, and Java.
 
 Extracts string literals, function definitions (with line numbers & snippets),
-internal and external call graphs, and endpoint-implementation mappings.
-
-Uses the new tree-sitter 0.22+ API with individual language packages
-(tree-sitter-python, tree-sitter-java, tree-sitter-typescript).
+internal and external call graphs, endpoint-implementation mappings,
+and HTTP client calls to external endpoints.
 """
 
 from __future__ import annotations
@@ -21,6 +19,7 @@ from bridgetrace.models.graph import (
     CallEdge,
     EndpointImpl,
     FunctionDef,
+    HttpCall,
     ParseResult,
     URIMatch,
 )
@@ -41,6 +40,26 @@ _LANG_NAME_MAP: dict[str, str] = {
     ".tsx": "tsx",
     ".java": "java",
 }
+
+_HTTP_METHOD_NAMES: frozenset[str] = frozenset(
+    {
+        "getForObject",
+        "postForObject",
+        "putForObject",
+        "deleteForObject",
+        "exchange",
+        "execute",
+        "get",
+        "post",
+        "put",
+        "delete",
+        "patch",
+        "head",
+        "options",
+        "fetch",
+        "request",
+    }
+)
 
 
 def _get_language_name(path: Path) -> str | None:
@@ -102,15 +121,24 @@ class TreeSitterParser(BaseParser):
         tree = parser.parse(source)
         root = tree.root_node
 
-        uris = self._extract_uri_literals(root, source, normalized_path)
         functions = self._extract_functions(root, source, normalized_path, lang)
 
         func_by_name: dict[str, tuple[str, int]] = {}
         for func in functions:
             func_by_name[func.name] = (func.name, func.line)
 
-        calls = self._extract_calls(root, source, normalized_path, lang, func_by_name)
         endpoint_impls = self._extract_endpoint_impls(root, source, normalized_path, lang)
+        impl_uris: set[str] = set()
+        for impl in endpoint_impls:
+            impl_uris.add(impl.uri)
+
+        http_calls = self._extract_http_calls(root, source, normalized_path, lang)
+        http_call_uris: set[str] = set()
+        for hc in http_calls:
+            http_call_uris.add(hc.uri)
+
+        uris = self._extract_uri_literals(root, source, normalized_path, impl_uris, http_call_uris)
+        calls = self._extract_calls(root, source, normalized_path, lang, func_by_name)
 
         return ParseResult(
             file_path=normalized_path,
@@ -118,17 +146,35 @@ class TreeSitterParser(BaseParser):
             functions=functions,
             calls=calls,
             endpoint_impls=endpoint_impls,
+            http_calls=http_calls,
         )
 
-    def _extract_uri_literals(self, root: Node, source: bytes, file_path: str) -> list[URIMatch]:
-        """Extract string literals that match the URI path pattern."""
+    def _extract_uri_literals(
+        self,
+        root: Node,
+        source: bytes,
+        file_path: str,
+        impl_uris: set[str],
+        http_call_uris: set[str],
+    ) -> list[URIMatch]:
+        """Extract string literals that match the URI path pattern.
+
+        Skips URIs already captured by endpoint_impls or http_calls to avoid
+        duplicates. Assigns role based on context.
+        """
         string_nodes = _find_nodes_by_type(root, "string")
         matches: list[URIMatch] = []
         for node in string_nodes:
             text = _node_text(node, source)
             cleaned = text.strip("\"'`")
-            if URI_PATH_RE.match(cleaned):
-                matches.append(URIMatch(uri=cleaned, source_file=file_path))
+            if not URI_PATH_RE.match(cleaned):
+                continue
+            if cleaned in impl_uris:
+                matches.append(URIMatch(uri=cleaned, source_file=file_path, role="implementation"))
+            elif cleaned in http_call_uris:
+                matches.append(URIMatch(uri=cleaned, source_file=file_path, role="reference"))
+            else:
+                matches.append(URIMatch(uri=cleaned, source_file=file_path, role="reference"))
         return matches
 
     def _extract_functions(
@@ -216,6 +262,47 @@ class TreeSitterParser(BaseParser):
                 results.append(EndpointImpl(uri=uri, function_name=name, function_line=line))
         return results
 
+    def _extract_http_calls(
+        self, root: Node, source: bytes, file_path: str, lang: str
+    ) -> list[HttpCall]:
+        """Extract HTTP client calls that target URI endpoints.
+
+        Detects patterns like:
+          Java:   restTemplate.getForObject("/api/v1/users", ...)
+          Python: requests.get("/api/v1/users")
+          TS:     axios.get("/api/v1/users")
+        """
+        call_nodes = _find_nodes_by_type(root, "call")
+        results: list[HttpCall] = []
+
+        for node in call_nodes:
+            callee_name = self._extract_callee_name(node, source, lang)
+            if callee_name is None:
+                continue
+            method_name = self._normalize_http_method(callee_name)
+            if method_name is None:
+                continue
+
+            caller_info = self._find_enclosing_function(node, source, lang)
+            if caller_info is None:
+                continue
+            caller_name, caller_line = caller_info
+            caller_key = f"{file_path}::{caller_name}:{caller_line}"
+
+            uri = self._find_uri_in_call_args(node, source)
+            if uri is None:
+                continue
+
+            results.append(
+                HttpCall(
+                    caller=caller_key,
+                    uri=uri,
+                    http_method=method_name,
+                    line=node.start_point[0] + 1,
+                )
+            )
+        return results
+
     def _find_annotation_uris(self, func_node: Node, source: bytes, lang: str) -> list[str]:
         """Find URI strings in annotations/decorators attached to a function."""
         uris: list[str] = []
@@ -246,20 +333,49 @@ class TreeSitterParser(BaseParser):
                         search_nodes.append(child)
 
         for search_node in search_nodes:
-            for string_node in _find_nodes_by_type(search_node, "string"):
-                text = _node_text(string_node, source)
-                cleaned = text.strip("\"'`")
-                if URI_PATH_RE.match(cleaned) and cleaned not in seen:
-                    seen.add(cleaned)
-                    uris.append(cleaned)
-            for string_node in _find_nodes_by_type(search_node, "string_literal"):
-                text = _node_text(string_node, source)
-                cleaned = text.strip("\"'`")
-                if URI_PATH_RE.match(cleaned) and cleaned not in seen:
-                    seen.add(cleaned)
-                    uris.append(cleaned)
+            for string_type in ("string", "string_literal"):
+                for string_node in _find_nodes_by_type(search_node, string_type):
+                    text = _node_text(string_node, source)
+                    cleaned = text.strip("\"'`")
+                    if URI_PATH_RE.match(cleaned) and cleaned not in seen:
+                        seen.add(cleaned)
+                        uris.append(cleaned)
 
         return uris
+
+    @staticmethod
+    def _normalize_http_method(callee_name: str) -> str | None:
+        """Extract the HTTP method from a callee name, if it is an HTTP client call."""
+        lower = callee_name.lower()
+
+        if lower in ("fetch", "request"):
+            return "GET"
+
+        for method in ("get", "post", "put", "delete", "patch", "head", "options"):
+            if lower == method or lower.endswith("." + method):
+                return method.upper()
+
+        for prefix in ("getfor", "postfor", "putfor", "deletefor"):
+            if lower.startswith(prefix):
+                return prefix[:-3].upper()
+
+        if lower == "exchange" or lower == "execute":
+            return "GET"
+
+        return None
+
+    @staticmethod
+    def _find_uri_in_call_args(node: Node, source: bytes) -> str | None:
+        """Find a URI string in the arguments of a call expression."""
+        for child in node.children:
+            if child.type in ("argument_list", "arguments"):
+                for arg in child.children:
+                    if arg.type in ("string", "string_literal"):
+                        text = _node_text(arg, source)
+                        cleaned = text.strip("\"'`")
+                        if URI_PATH_RE.match(cleaned):
+                            return cleaned
+        return None
 
     @staticmethod
     def _function_node_type(lang: str) -> str:
@@ -308,10 +424,7 @@ class TreeSitterParser(BaseParser):
 
     @staticmethod
     def _find_enclosing_function(node: Node, source: bytes, lang: str) -> tuple[str, int] | None:
-        """Walk up the tree to find the enclosing function definition.
-
-        Returns (function_name, line_number) or None.
-        """
+        """Walk up the tree to find the enclosing function definition."""
         func_type = TreeSitterParser._function_node_type(lang)
         current = node.parent
         while current is not None:

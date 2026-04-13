@@ -10,6 +10,7 @@ class URIMatch(BaseModel):
 
     uri: str
     source_file: str
+    role: str = ""
 
 
 class FunctionDef(BaseModel):
@@ -38,6 +39,15 @@ class EndpointImpl(BaseModel):
     function_line: int
 
 
+class HttpCall(BaseModel):
+    """An HTTP client call to an external endpoint."""
+
+    caller: str
+    uri: str
+    http_method: str = ""
+    line: int = 0
+
+
 class ParseResult(BaseModel):
     """Aggregated result from a single file parse."""
 
@@ -46,6 +56,7 @@ class ParseResult(BaseModel):
     functions: list[FunctionDef] = Field(default_factory=list)
     calls: list[CallEdge] = Field(default_factory=list)
     endpoint_impls: list[EndpointImpl] = Field(default_factory=list)
+    http_calls: list[HttpCall] = Field(default_factory=list)
 
 
 class GraphNode(BaseModel):

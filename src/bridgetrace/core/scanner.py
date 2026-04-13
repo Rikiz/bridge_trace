@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from pathlib import Path
 from typing import Sequence
 
@@ -33,6 +34,8 @@ _SCAN_EXTENSIONS: set[str] = {
     ".java",
     ".class",
 }
+
+_PARAM_RE = re.compile(r"\{[^}]*\}")
 
 
 class Scanner:
@@ -65,11 +68,13 @@ class Scanner:
     ) -> tuple[list[GraphNode], list[GraphEdge]]:
         """Convert parse results into Neo4j-ready nodes and edges.
 
-        Uses a multi-phase approach:
-          Phase 1: Create all nodes and CONTAINS edges, build indexes
-          Phase 2: Create CALLS_INTERNAL / CALLS_EXTERNAL edges
-          Phase 3: Create IMPLEMENTS / IMPLEMENTED_BY / DEFINED_IN edges
-          Phase 4: Create Endpoint CALLS Endpoint edges (derived)
+        Multi-phase approach:
+          Phase 1: Create all nodes + CONTAINS edges, build indexes
+          Phase 2: CALLS_INTERNAL / CALLS_EXTERNAL edges
+          Phase 2.5: CONSUMES edges (Function → Endpoint via HTTP calls)
+          Phase 3: IMPLEMENTS / IMPLEMENTED_BY / DEFINED_IN edges
+          Phase 3.5: ROUTES_TO edges (declaration Endpoint → implementation Endpoint)
+          Phase 4: Endpoint CALLS Endpoint (derived from all paths)
         """
         nodes: list[GraphNode] = []
         edges: list[GraphEdge] = []
@@ -80,25 +85,27 @@ class Scanner:
             reverse=True,
         )
 
-        # ── Phase 1: Nodes + CONTAINS edges ──────────────────────────
+        # ── Phase 1: Nodes + CONTAINS ────────────────────────────────
         seen_repo_ids: set[str] = set()
         seen_file_ids: set[str] = set()
         seen_endpoint_edges: set[str] = set()
         seen_function_edges: set[str] = set()
 
-        # Indexes for later phases
-        # func_id by (file_path, func_name, func_line)
         func_key_to_id: dict[str, str] = {}
-        # function short name → [(repo_name, func_id)] for external call resolution
         func_name_to_ids: dict[str, list[tuple[str, str]]] = {}
-        # func_id → set of endpoint_ids it implements
         func_id_to_ep_ids: dict[str, set[str]] = {}
-        # endpoint_id → set of func_ids that implement it
         ep_id_to_func_ids: dict[str, set[str]] = {}
-        # endpoint_id → file_id
         ep_id_to_file_id: dict[str, str] = {}
-        # uri → endpoint_id
         uri_to_ep_id: dict[str, str] = {}
+        ep_id_to_role: dict[str, str] = {}
+        ep_id_to_func_name: dict[str, str] = {}
+
+        # Build endpoint_impls index: (uri, file_path) -> function_name
+        impl_uri_to_func: dict[tuple[str, str], str] = {}
+        for result in results:
+            fpath = normalize_path(result.file_path)
+            for impl in result.endpoint_impls:
+                impl_uri_to_func[(impl.uri, fpath)] = impl.function_name
 
         group_id = f"group:{group_name}"
         nodes.append(GraphNode(label="Group", properties={"id": group_id, "name": group_name}))
@@ -138,8 +145,23 @@ class Scanner:
             for uri_match in result.uris:
                 ep_id = f"endpoint:{_stable_id(uri_match.uri)}"
                 ep_edge_key = f"{file_id}->CONTAINS->{ep_id}"
+
+                func_name = ""
+                role = uri_match.role or "reference"
+                if role == "implementation":
+                    func_name = impl_uri_to_func.get((uri_match.uri, fpath), "")
+
                 nodes.append(
-                    GraphNode(label="Endpoint", properties={"id": ep_id, "uri": uri_match.uri})
+                    GraphNode(
+                        label="Endpoint",
+                        properties={
+                            "id": ep_id,
+                            "uri": uri_match.uri,
+                            "role": role,
+                            "file_path": fpath,
+                            "function_name": func_name,
+                        },
+                    )
                 )
                 if ep_edge_key not in seen_endpoint_edges:
                     seen_endpoint_edges.add(ep_edge_key)
@@ -154,6 +176,9 @@ class Scanner:
                     )
                 ep_id_to_file_id[ep_id] = file_id
                 uri_to_ep_id[uri_match.uri] = ep_id
+                ep_id_to_role[ep_id] = role
+                if func_name:
+                    ep_id_to_func_name[ep_id] = func_name
 
             for func in result.functions:
                 func_key = f"{fpath}::{func.name}:{func.line}"
@@ -191,8 +216,10 @@ class Scanner:
                 ep_id = f"endpoint:{_stable_id(impl.uri)}"
                 func_id_to_ep_ids.setdefault(func_id, set()).add(ep_id)
                 ep_id_to_func_ids.setdefault(ep_id, set()).add(func_id)
+                ep_id_to_role[ep_id] = "implementation"
+                ep_id_to_func_name[ep_id] = impl.function_name
 
-        # ── Phase 2: Call edges (INTERNAL + EXTERNAL) ────────────────
+        # ── Phase 2: Call edges ───────────────────────────────────────
         for result in results:
             fpath = normalize_path(result.file_path)
             repo_name = _match_repo(fpath, sorted_roots)
@@ -226,7 +253,41 @@ class Scanner:
                             )
                         )
 
-        # ── Phase 3: IMPLEMENTS / IMPLEMENTED_BY / DEFINED_IN ────────
+        # ── Phase 2.5: CONSUMES edges (Function → Endpoint via HTTP) ──
+        # Also enrich Endpoint function_name for reference-role endpoints
+        for result in results:
+            fpath = normalize_path(result.file_path)
+
+            for hc in result.http_calls:
+                caller_func_id = f"func:{_stable_id(hc.caller)}"
+
+                target_ep_id = uri_to_ep_id.get(hc.uri)
+                if target_ep_id is None:
+                    target_ep_id = _fuzzy_match_endpoint(hc.uri, uri_to_ep_id, ep_id_to_role)
+
+                if target_ep_id is not None:
+                    edges.append(
+                        GraphEdge(
+                            rel_type="CONSUMES",
+                            from_label="Function",
+                            from_id=caller_func_id,
+                            to_label="Endpoint",
+                            to_id=target_ep_id,
+                            properties={"http_method": hc.http_method, "line": hc.line},
+                        )
+                    )
+
+                    if target_ep_id not in ep_id_to_func_name:
+                        caller_func_key = hc.caller
+                        caller_short = caller_func_key.rsplit("::", 1)[-1].rsplit(":", 1)[0]
+                        ep_id_to_func_name[target_ep_id] = caller_short
+                        if target_ep_id in ep_id_to_role:
+                            if ep_id_to_role[target_ep_id] == "reference":
+                                pass
+                        else:
+                            ep_id_to_role[target_ep_id] = "reference"
+
+        # ── Phase 3: IMPLEMENTS / IMPLEMENTED_BY / DEFINED_IN ─────────
         seen_impl_edges: set[str] = set()
 
         for func_id, ep_ids in func_id_to_ep_ids.items():
@@ -273,11 +334,81 @@ class Scanner:
                     )
                 )
 
+        # ── Phase 3.5: ROUTES_TO (declaration → implementation) ──────
+        declaration_eps = [
+            (ep_id, ep_props["uri"])
+            for ep_id, ep_props in _iter_endpoint_nodes(nodes)
+            if ep_props.get("role") == "declaration"
+        ]
+        implementation_eps = [
+            (ep_id, ep_props["uri"])
+            for ep_id, ep_props in _iter_endpoint_nodes(nodes)
+            if ep_props.get("role") == "implementation"
+        ]
+
+        seen_routes_edges: set[str] = set()
+        for decl_ep_id, decl_uri in declaration_eps:
+            for impl_ep_id, impl_uri in implementation_eps:
+                if _uri_suffix_match(decl_uri, impl_uri):
+                    edge_key = f"{decl_ep_id}->ROUTES_TO->{impl_ep_id}"
+                    if edge_key not in seen_routes_edges:
+                        seen_routes_edges.add(edge_key)
+                        edges.append(
+                            GraphEdge(
+                                rel_type="ROUTES_TO",
+                                from_label="Endpoint",
+                                from_id=decl_ep_id,
+                                to_label="Endpoint",
+                                to_id=impl_ep_id,
+                            )
+                        )
+
         # ── Phase 4: Endpoint CALLS Endpoint (derived) ───────────────
-        # If func A implements endpoint EA and func A calls func B
-        # which implements endpoint EB, then EA calls EB.
         seen_ep_call_edges: set[str] = set()
 
+        # Path 1: func implements epA, func CONSUMES epB → epA CALLS epB
+        for edge in edges:
+            if edge.rel_type != "CONSUMES":
+                continue
+            caller_func_id = edge.from_id
+            target_ep_id = edge.to_id
+            caller_eps = func_id_to_ep_ids.get(caller_func_id, set())
+            for src_ep in caller_eps:
+                if src_ep == target_ep_id:
+                    continue
+                ep_call_key = f"{src_ep}->CALLS->{target_ep_id}"
+                if ep_call_key not in seen_ep_call_edges:
+                    seen_ep_call_edges.add(ep_call_key)
+                    edges.append(
+                        GraphEdge(
+                            rel_type="CALLS",
+                            from_label="Endpoint",
+                            from_id=src_ep,
+                            to_label="Endpoint",
+                            to_id=target_ep_id,
+                        )
+                    )
+
+        # Path 2: ROUTES_TO → CALLS (gateway ep → backend ep)
+        for edge in list(edges):
+            if edge.rel_type != "ROUTES_TO":
+                continue
+            src_ep = edge.from_id
+            dst_ep = edge.to_id
+            ep_call_key = f"{src_ep}->CALLS->{dst_ep}"
+            if ep_call_key not in seen_ep_call_edges:
+                seen_ep_call_edges.add(ep_call_key)
+                edges.append(
+                    GraphEdge(
+                        rel_type="CALLS",
+                        from_label="Endpoint",
+                        from_id=src_ep,
+                        to_label="Endpoint",
+                        to_id=dst_ep,
+                    )
+                )
+
+        # Path 3: func implements epA, func calls funcB, funcB implements epB
         for edge in edges:
             if edge.rel_type not in ("CALLS_INTERNAL", "CALLS_EXTERNAL"):
                 continue
@@ -301,6 +432,16 @@ class Scanner:
                                 to_id=dst_ep,
                             )
                         )
+
+        # Enrich Endpoint nodes with final role/function_name
+        for i, node in enumerate(nodes):
+            if node.label != "Endpoint":
+                continue
+            ep_id = node.properties["id"]
+            if ep_id in ep_id_to_role and "role" not in node.properties:
+                node.properties["role"] = ep_id_to_role[ep_id]
+            if ep_id in ep_id_to_func_name and "function_name" not in node.properties:
+                node.properties["function_name"] = ep_id_to_func_name[ep_id]
 
         return nodes, edges
 
@@ -348,6 +489,47 @@ class Scanner:
         return None
 
 
+def _iter_endpoint_nodes(nodes: list[GraphNode]):
+    """Yield (ep_id, properties) for Endpoint nodes."""
+    for node in nodes:
+        if node.label == "Endpoint":
+            yield node.properties["id"], node.properties
+
+
+def _uri_suffix_match(decl_uri: str, impl_uri: str) -> bool:
+    """Check if a declaration URI suffix-matches an implementation URI.
+
+    Example:
+      /data/v1/tanet-config/{userid} vs /v1/tanet-config/{userid} → True
+      /api/v1/users vs /v1/users → True
+      /v1/users vs /v1/orders → False
+    """
+    norm_decl = _PARAM_RE.sub("{}", decl_uri)
+    norm_impl = _PARAM_RE.sub("{}", impl_uri)
+    decl_parts = [p for p in norm_decl.split("/") if p]
+    impl_parts = [p for p in norm_impl.split("/") if p]
+    if len(impl_parts) < 2:
+        return False
+    if len(decl_parts) < len(impl_parts):
+        return False
+    decl_tail = decl_parts[-len(impl_parts) :]
+    return decl_tail == impl_parts
+
+
+def _fuzzy_match_endpoint(
+    uri: str,
+    uri_to_ep_id: dict[str, str],
+    ep_id_to_role: dict[str, str],
+) -> str | None:
+    """Try suffix-matching a URI against implementation-role endpoints."""
+    for existing_uri, ep_id in uri_to_ep_id.items():
+        if ep_id_to_role.get(ep_id) != "implementation":
+            continue
+        if _uri_suffix_match(uri, existing_uri) or _uri_suffix_match(existing_uri, uri):
+            return ep_id
+    return None
+
+
 def _match_repo(fpath: str, sorted_roots: list[str]) -> str:
     """Determine repo name by longest-prefix matching against group root paths."""
     for root in sorted_roots:
@@ -374,11 +556,7 @@ def _resolve_external_callee(
     caller_repo: str,
     func_name_to_ids: dict[str, list[tuple[str, str]]],
 ) -> str | None:
-    """Resolve an external callee name to a func_id.
-
-    Tries exact name first, then the last segment after '.'.
-    Prefers functions in the same repo, falls back to any repo.
-    """
+    """Resolve an external callee name to a func_id."""
     candidates = _lookup_callee(callee_name, caller_repo, func_name_to_ids)
     if candidates is None and "." in callee_name:
         short_name = callee_name.rsplit(".", 1)[-1]
@@ -395,7 +573,6 @@ def _lookup_callee(
     entries = func_name_to_ids.get(name)
     if not entries:
         return None
-
     same_repo = [fid for repo, fid in entries if repo == caller_repo]
     if len(same_repo) == 1:
         return same_repo[0]

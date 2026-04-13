@@ -44,8 +44,43 @@ _TRACE_ENDPOINT_CALLS_CYPHER = """
 MATCH (src:Endpoint {uri: $uri})-[:CALLS]->(dst:Endpoint)
 OPTIONAL MATCH (dst)<-[:IMPLEMENTED_BY]-(func:Function)
 RETURN dst.uri AS called_endpoint,
+       dst.role AS called_role,
+       dst.file_path AS called_file,
+       dst.function_name AS called_function,
        func.name AS implementing_function,
        func.file_path AS function_file
+"""
+
+_TRACE_CROSS_REPO_CYPHER = """
+MATCH (src:Endpoint {uri: $uri})-[r:ROUTES_TO|CALLS]->(dst:Endpoint)
+OPTIONAL MATCH (dst)<-[:IMPLEMENTED_BY]-(func:Function)
+OPTIONAL MATCH (src)<-[:IMPLEMENTED_BY]-(src_func:Function)
+RETURN src.uri AS source_endpoint,
+       src.role AS source_role,
+       src.file_path AS source_file,
+       src.function_name AS source_function,
+       type(r) AS relation_type,
+       dst.uri AS target_endpoint,
+       dst.role AS target_role,
+       dst.file_path AS target_file,
+       dst.function_name AS target_function,
+       func.name AS implementing_function,
+       func.file_path AS function_file
+"""
+
+_TRACE_CONSUMES_CYPHER = """
+MATCH (func:Function)-[:CONSUMES]->(ep:Endpoint {uri: $uri})
+RETURN func.name AS consumer_function,
+       func.file_path AS consumer_file,
+       ep.uri AS consumed_endpoint
+"""
+
+_TRACE_CONSUMES_BY_FUNC_CYPHER = """
+MATCH (func:Function {id: $func_id})-[:CONSUMES]->(ep:Endpoint)
+RETURN ep.uri AS consumed_endpoint,
+       ep.role AS endpoint_role,
+       ep.file_path AS endpoint_file,
+       ep.function_name AS endpoint_function
 """
 
 
@@ -104,6 +139,22 @@ class TraceEngine:
         """Trace which other endpoints are called by the given endpoint."""
         records = self._client.run(
             _TRACE_ENDPOINT_CALLS_CYPHER,
+            {"uri": uri},
+        )
+        return TraceResult(records)
+
+    def trace_cross_repo(self, uri: str) -> TraceResult:
+        """Trace cross-repository routing: gateway endpoint → backend endpoint."""
+        records = self._client.run(
+            _TRACE_CROSS_REPO_CYPHER,
+            {"uri": uri},
+        )
+        return TraceResult(records)
+
+    def trace_consumers(self, uri: str) -> TraceResult:
+        """Find which functions consume the given endpoint via HTTP calls."""
+        records = self._client.run(
+            _TRACE_CONSUMES_CYPHER,
             {"uri": uri},
         )
         return TraceResult(records)

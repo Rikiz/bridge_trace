@@ -24,8 +24,11 @@ SCHEMA_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS FOR (n:Endpoint) ON (n.uri)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Function) ON (n.name)",
     "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.path)",
+    "CREATE INDEX IF NOT EXISTS FOR (n:Endpoint) ON (n.role)",
     "CREATE INDEX IF NOT EXISTS FOR ()-[r:CALLS]-() ON (type(r))",
     "CREATE INDEX IF NOT EXISTS FOR ()-[r:CALLS_EXTERNAL]-() ON (type(r))",
+    "CREATE INDEX IF NOT EXISTS FOR ()-[r:ROUTES_TO]-() ON (type(r))",
+    "CREATE INDEX IF NOT EXISTS FOR ()-[r:CONSUMES]-() ON (type(r))",
     "CREATE INDEX IF NOT EXISTS FOR ()-[r:IMPLEMENTS]-() ON (type(r))",
     "CREATE INDEX IF NOT EXISTS FOR ()-[r:DEFINED_IN]-() ON (type(r))",
 ]

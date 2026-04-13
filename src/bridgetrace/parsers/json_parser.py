@@ -30,7 +30,7 @@ def _walk_values(obj: Any, source_path: str) -> list[URIMatch]:
         for item in obj:
             matches.extend(_walk_values(item, source_path))
     elif isinstance(obj, str) and URI_PATH_RE.match(obj):
-        matches.append(URIMatch(uri=obj, source_file=source_path))
+        matches.append(URIMatch(uri=obj, source_file=source_path, role="declaration"))
 
     return matches
 

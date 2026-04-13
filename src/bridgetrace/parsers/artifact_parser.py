@@ -55,6 +55,8 @@ class ArtifactParser(BaseParser):
                 uri = m.group(1)
                 if uri not in seen:
                     seen.add(uri)
-                    matches.append(URIMatch(uri=uri, source_file=normalized_path))
+                    matches.append(
+                        URIMatch(uri=uri, source_file=normalized_path, role="implementation")
+                    )
 
         return matches
