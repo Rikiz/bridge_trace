@@ -11,12 +11,9 @@ import pathspec
 
 from bridgetrace.config import settings
 from bridgetrace.models.graph import (
-    CallEdge,
-    FunctionDef,
     GraphEdge,
     GraphNode,
     ParseResult,
-    URIMatch,
 )
 from bridgetrace.parsers.artifact_parser import ArtifactParser
 from bridgetrace.parsers.base import BaseParser
@@ -70,6 +67,9 @@ class Scanner:
         nodes: list[GraphNode] = []
         edges: list[GraphEdge] = []
         seen_repo_ids: set[str] = set()
+        seen_file_ids: set[str] = set()
+        seen_endpoint_edges: set[str] = set()
+        seen_function_edges: set[str] = set()
 
         group_id = f"group:{group_name}"
         nodes.append(GraphNode(label="Group", properties={"id": group_id, "name": group_name}))
@@ -78,7 +78,7 @@ class Scanner:
             fpath = normalize_path(result.file_path)
             file_id = f"file:{_stable_id(fpath)}"
 
-            repo_name = self._infer_repo_name(Path(fpath))
+            repo_name = self._infer_repo_name(fpath)
             repo_id = f"repo:{repo_name}"
 
             if repo_id not in seen_repo_ids:
@@ -94,37 +94,43 @@ class Scanner:
                     )
                 )
 
-            nodes.append(GraphNode(label="File", properties={"id": file_id, "path": fpath}))
-            edges.append(
-                GraphEdge(
-                    rel_type="CONTAINS",
-                    from_label="Repo",
-                    from_id=repo_id,
-                    to_label="File",
-                    to_id=file_id,
+            if file_id not in seen_file_ids:
+                seen_file_ids.add(file_id)
+                nodes.append(GraphNode(label="File", properties={"id": file_id, "path": fpath}))
+                edges.append(
+                    GraphEdge(
+                        rel_type="CONTAINS",
+                        from_label="Repo",
+                        from_id=repo_id,
+                        to_label="File",
+                        to_id=file_id,
+                    )
                 )
-            )
 
             for uri_match in result.uris:
                 ep_id = f"endpoint:{_stable_id(uri_match.uri)}"
+                ep_edge_key = f"{file_id}->CONTAINS->{ep_id}"
                 nodes.append(
                     GraphNode(
                         label="Endpoint",
                         properties={"id": ep_id, "uri": uri_match.uri},
                     )
                 )
-                edges.append(
-                    GraphEdge(
-                        rel_type="CONTAINS",
-                        from_label="File",
-                        from_id=file_id,
-                        to_label="Endpoint",
-                        to_id=ep_id,
+                if ep_edge_key not in seen_endpoint_edges:
+                    seen_endpoint_edges.add(ep_edge_key)
+                    edges.append(
+                        GraphEdge(
+                            rel_type="CONTAINS",
+                            from_label="File",
+                            from_id=file_id,
+                            to_label="Endpoint",
+                            to_id=ep_id,
+                        )
                     )
-                )
 
             for func in result.functions:
                 func_id = f"func:{_stable_id(f'{fpath}::{func.name}:{func.line}')}"
+                func_edge_key = f"{file_id}->CONTAINS->{func_id}"
                 nodes.append(
                     GraphNode(
                         label="Function",
@@ -137,15 +143,17 @@ class Scanner:
                         },
                     )
                 )
-                edges.append(
-                    GraphEdge(
-                        rel_type="CONTAINS",
-                        from_label="File",
-                        from_id=file_id,
-                        to_label="Function",
-                        to_id=func_id,
+                if func_edge_key not in seen_function_edges:
+                    seen_function_edges.add(func_edge_key)
+                    edges.append(
+                        GraphEdge(
+                            rel_type="CONTAINS",
+                            from_label="File",
+                            from_id=file_id,
+                            to_label="Function",
+                            to_id=func_id,
+                        )
                     )
-                )
 
             for call in result.calls:
                 caller_id = f"func:{_stable_id(call.caller)}"
@@ -187,13 +195,17 @@ class Scanner:
 
     def _parse_file(self, path: Path) -> ParseResult | None:
         """Dispatch a file to the first compatible parser."""
+        last_error: Exception | None = None
         for parser in self._parsers:
             if parser.can_parse(path):
                 try:
                     return parser.parse(path)
-                except Exception:
-                    logger.warning("Failed to parse %s", path, exc_info=True)
-                    return None
+                except Exception as exc:
+                    logger.warning("Parser %s failed on %s: %s", type(parser).__name__, path, exc)
+                    last_error = exc
+                    continue
+        if last_error is not None:
+            logger.error("All parsers failed for %s", path, exc_info=last_error)
         return None
 
     @staticmethod
@@ -206,11 +218,10 @@ class Scanner:
         return None
 
     @staticmethod
-    def _infer_repo_name(path: Path) -> str:
-        """Best-effort inference of the repository name from a file path."""
-        # Use absolute() instead of resolve() to avoid filesystem access
-        # and maintain cross-platform consistency
-        parts = path.absolute().parts
+    def _infer_repo_name(normalized_posix_path: str) -> str:
+        """Best-effort inference of the repository name from a normalized POSIX path."""
+        # normalized_posix_path is always POSIX (forward slashes, e.g. C:/Users/project/src/main.java)
+        parts = [p for p in normalized_posix_path.split("/") if p]
         for i in range(len(parts) - 1, -1, -1):
             if parts[i].endswith(".git"):
                 return parts[i].removesuffix(".git")
@@ -221,6 +232,15 @@ class Scanner:
 
 
 def _stable_id(text: str) -> str:
-    """Generate a deterministic short id from text, normalizing paths for cross-platform consistency."""
+    """Generate a deterministic short id from text.
+
+    For pure file paths, normalize to POSIX first for cross-platform consistency.
+    For composite keys (e.g. "path::name:line"), the path component is already
+    normalized by the parser, so hash directly to avoid resolve() side effects.
+    """
+    if "::" in text:
+        # Composite key like "path::func_name:line" — path already normalized
+        return hashlib.sha256(text.encode()).hexdigest()[:16]
+    # Pure path — normalize for cross-platform consistency
     normalized = sanitize_for_id(text)
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
