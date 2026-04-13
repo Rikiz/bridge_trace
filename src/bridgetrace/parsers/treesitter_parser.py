@@ -14,6 +14,7 @@ from tree_sitter import Node
 from bridgetrace.models.graph import ParseResult, FunctionDef, CallEdge, URIMatch
 from bridgetrace.parsers.base import BaseParser
 from bridgetrace.parsers.json_parser import URI_PATH_RE
+from bridgetrace.utils import normalize_path
 
 _LANG_MAP: dict[str, str] = {
     ".py": "python",
@@ -67,26 +68,29 @@ class TreeSitterParser(BaseParser):
     def parse(self, path: Path) -> ParseResult:
         """Parse a source file and extract string literals, functions, and calls."""
         lang = _get_language_name(path)
+        # Normalize path for cross-platform consistency
+        normalized_path = normalize_path(path)
+
         if lang is None:
-            return ParseResult(file_path=str(path), uris=[], functions=[], calls=[])
+            return ParseResult(file_path=normalized_path, uris=[], functions=[], calls=[])
 
         source = path.read_bytes()
         parser = self._get_parser(lang)
         tree = parser.parse(source)
         root = tree.rootNode
 
-        uris = self._extract_uri_literals(root, source, str(path))
-        functions = self._extract_functions(root, source, str(path), lang)
+        uris = self._extract_uri_literals(root, source, normalized_path)
+        functions = self._extract_functions(root, source, normalized_path, lang)
 
         # Build mapping of function name to (name, line) within the same file
         func_by_name: dict[str, tuple[str, int]] = {}
         for func in functions:
             func_by_name[func.name] = (func.name, func.line)
 
-        calls = self._extract_calls(root, source, str(path), lang, func_by_name)
+        calls = self._extract_calls(root, source, normalized_path, lang, func_by_name)
 
         return ParseResult(
-            file_path=str(path),
+            file_path=normalized_path,
             uris=uris,
             functions=functions,
             calls=calls,

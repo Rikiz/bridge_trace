@@ -11,6 +11,7 @@ from pathlib import Path
 
 from bridgetrace.models.graph import ParseResult, URIMatch
 from bridgetrace.parsers.base import BaseParser
+from bridgetrace.utils import normalize_path
 
 _ANNOTATION_PATH_RE = re.compile(
     r'"(\/(?:[\w\-\.]+\/)+[\w\-\.]*)"'
@@ -24,12 +25,14 @@ class ArtifactParser(BaseParser):
 
     def parse(self, path: Path) -> ParseResult:
         """Run javap -v on a .class file and extract annotation path strings."""
-        uris = self._extract_annotation_uris(path)
-        return ParseResult(file_path=str(path), uris=uris, functions=[], calls=[])
+        normalized_path = normalize_path(path)
+        uris = self._extract_annotation_uris(path, normalized_path)
+        return ParseResult(file_path=normalized_path, uris=uris, functions=[], calls=[])
 
-    def _extract_annotation_uris(self, path: Path) -> list[URIMatch]:
+    def _extract_annotation_uris(self, path: Path, normalized_path: str) -> list[URIMatch]:
         """Call javap -v and parse annotation strings for URI paths."""
         try:
+            # Use the original path string for subprocess (OS-specific)
             result = subprocess.run(
                 ["javap", "-v", str(path)],
                 capture_output=True,
@@ -52,6 +55,6 @@ class ArtifactParser(BaseParser):
                 uri = m.group(1)
                 if uri not in seen:
                     seen.add(uri)
-                    matches.append(URIMatch(uri=uri, source_file=str(path)))
+                    matches.append(URIMatch(uri=uri, source_file=normalized_path))
 
         return matches

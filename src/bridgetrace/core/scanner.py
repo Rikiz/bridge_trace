@@ -22,6 +22,7 @@ from bridgetrace.parsers.artifact_parser import ArtifactParser
 from bridgetrace.parsers.base import BaseParser
 from bridgetrace.parsers.json_parser import JsonYamlParser
 from bridgetrace.parsers.treesitter_parser import TreeSitterParser
+from bridgetrace.utils import normalize_path, sanitize_for_id
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ class Scanner:
         nodes.append(GraphNode(label="Group", properties={"id": group_id, "name": group_name}))
 
         for result in results:
-            fpath = result.file_path
+            fpath = normalize_path(result.file_path)
             file_id = f"file:{_stable_id(fpath)}"
 
             repo_name = self._infer_repo_name(Path(fpath))
@@ -207,7 +208,9 @@ class Scanner:
     @staticmethod
     def _infer_repo_name(path: Path) -> str:
         """Best-effort inference of the repository name from a file path."""
-        parts = path.resolve().parts
+        # Use absolute() instead of resolve() to avoid filesystem access
+        # and maintain cross-platform consistency
+        parts = path.absolute().parts
         for i in range(len(parts) - 1, -1, -1):
             if parts[i].endswith(".git"):
                 return parts[i].removesuffix(".git")
@@ -218,5 +221,6 @@ class Scanner:
 
 
 def _stable_id(text: str) -> str:
-    """Generate a deterministic short id from text."""
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+    """Generate a deterministic short id from text, normalizing paths for cross-platform consistency."""
+    normalized = sanitize_for_id(text)
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
