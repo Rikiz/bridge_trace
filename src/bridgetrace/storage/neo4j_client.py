@@ -26,6 +26,7 @@ SCHEMA_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS FOR (n:Function) ON (n.name)",
     "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.path)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Endpoint) ON (n.role)",
+    "CREATE INDEX IF NOT EXISTS FOR (n:Endpoint) ON (n.http_method)",
     "CREATE INDEX IF NOT EXISTS FOR ()-[r:CALLS_EXTERNAL]-() ON (r.line)",
     "CREATE INDEX IF NOT EXISTS FOR ()-[r:CONSUMES]-() ON (r.http_method)",
 ]

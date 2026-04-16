@@ -25,6 +25,20 @@ from bridgetrace.utils import normalize_path, sanitize_for_id
 
 logger = logging.getLogger(__name__)
 
+
+class ScanProgress:
+    """Callback interface for scan progress reporting."""
+
+    def on_discovery(self, total_files: int) -> None:
+        pass
+
+    def on_file_parsed(self, index: int, path: str) -> None:
+        pass
+
+    def on_phase(self, phase: str, detail: str = "") -> None:
+        pass
+
+
 _SCAN_EXTENSIONS: set[str] = {
     ".json",
     ".yaml",
@@ -42,7 +56,11 @@ _PARAM_RE = re.compile(r"\$\{[^}]*\}|\{[^}]*\}")
 class Scanner:
     """Orchestrates file discovery, parser dispatch, and graph model construction."""
 
-    def __init__(self, ignore_gitignore: bool | None = None) -> None:
+    def __init__(
+        self,
+        ignore_gitignore: bool | None = None,
+        progress: ScanProgress | None = None,
+    ) -> None:
         self._ignore_gitignore = (
             ignore_gitignore if ignore_gitignore is not None else settings.ignore_gitignore
         )
@@ -51,17 +69,20 @@ class Scanner:
             TreeSitterParser(),
             ArtifactParser(),
         ]
+        self._progress = progress or ScanProgress()
 
     def scan_paths(self, roots: Sequence[Path]) -> list[ParseResult]:
         """Walk all roots and return aggregated parse results."""
         all_files = self._discover_files(roots)
+        self._progress.on_discovery(len(all_files))
         logger.info("Discovered %d files across %d roots", len(all_files), len(roots))
 
         results: list[ParseResult] = []
-        for fpath in all_files:
+        for idx, fpath in enumerate(all_files):
             result = self._parse_file(fpath)
             if result is not None:
                 results.append(result)
+            self._progress.on_file_parsed(idx + 1, str(fpath))
         return results
 
     def build_graph_entities(
@@ -87,6 +108,7 @@ class Scanner:
         )
 
         # ── Phase 1: Nodes + CONTAINS ────────────────────────────────
+        self._progress.on_phase("Phase 1", "Building nodes + CONTAINS edges")
         seen_repo_ids: set[str] = set()
         seen_file_ids: set[str] = set()
         seen_endpoint_edges: set[str] = set()
@@ -97,16 +119,53 @@ class Scanner:
         func_id_to_ep_ids: dict[str, set[str]] = {}
         ep_id_to_func_ids: dict[str, set[str]] = {}
         ep_id_to_file_id: dict[str, str] = {}
-        uri_to_ep_id: dict[str, str] = {}
+        uri_to_ep_ids: dict[str, list[str]] = {}
         ep_id_to_role: dict[str, str] = {}
         ep_id_to_func_name: dict[str, str] = {}
+        ep_id_to_http_method: dict[str, str] = {}
 
-        # Build endpoint_impls index: (uri, file_path) -> function_name
-        impl_uri_to_func: dict[tuple[str, str], str] = {}
+        # Build endpoint_impls index: (uri, file_path) -> (function_name, http_method)
+        impl_uri_to_func: dict[tuple[str, str], tuple[str, str]] = {}
         for result in results:
             fpath = normalize_path(result.file_path)
             for impl in result.endpoint_impls:
-                impl_uri_to_func[(impl.uri, fpath)] = impl.function_name
+                impl_uri_to_func[(impl.uri, fpath)] = (impl.function_name, impl.http_method)
+
+        # Build global URI variable resolution map with import support
+        global_var_to_uri: dict[str, str] = {}
+        for result in results:
+            fpath = normalize_path(result.file_path)
+            for uv in result.uri_vars:
+                if uv.is_exported:
+                    global_var_to_uri[uv.name] = uv.uri
+
+        local_var_to_uri: dict[tuple[str, str], str] = {}
+        for result in results:
+            fpath = normalize_path(result.file_path)
+            for uv in result.uri_vars:
+                local_var_to_uri[(fpath, uv.name)] = uv.uri
+
+        import_resolution: dict[tuple[str, str], str] = {}
+        for result in results:
+            fpath = normalize_path(result.file_path)
+            for imp in result.imports:
+                resolved_name = imp.source_name if imp.source_name != "*" else imp.local_name
+                import_resolution[(fpath, imp.local_name)] = resolved_name
+
+        def resolve_uri_var(file_path: str, var_name: str) -> str | None:
+            if var_name in global_var_to_uri:
+                return global_var_to_uri[var_name]
+            key = (file_path, var_name)
+            if key in local_var_to_uri:
+                return local_var_to_uri[key]
+            if key in import_resolution:
+                resolved = import_resolution[key]
+                if resolved in global_var_to_uri:
+                    return global_var_to_uri[resolved]
+                resolved_key = (file_path, resolved)
+                if resolved_key in local_var_to_uri:
+                    return local_var_to_uri[resolved_key]
+            return None
 
         group_id = f"group:{group_name}"
         nodes.append(GraphNode(label="Group", properties={"id": group_id, "name": group_name}))
@@ -144,13 +203,18 @@ class Scanner:
                 )
 
             for uri_match in result.uris:
-                ep_id = f"endpoint:{_stable_id(uri_match.uri)}"
+                ep_id = f"endpoint:{_stable_id(fpath + uri_match.uri)}"
                 ep_edge_key = f"{file_id}->CONTAINS->{ep_id}"
 
                 func_name = ""
+                http_method = uri_match.http_method
                 role = uri_match.role or "reference"
                 if role == "implementation":
-                    func_name = impl_uri_to_func.get((uri_match.uri, fpath), "")
+                    impl_info = impl_uri_to_func.get((uri_match.uri, fpath))
+                    if impl_info:
+                        func_name = impl_info[0]
+                        if not http_method:
+                            http_method = impl_info[1]
 
                 nodes.append(
                     GraphNode(
@@ -161,6 +225,7 @@ class Scanner:
                             "role": role,
                             "file_path": fpath,
                             "function_name": func_name,
+                            "http_method": http_method,
                         },
                     )
                 )
@@ -176,10 +241,12 @@ class Scanner:
                         )
                     )
                 ep_id_to_file_id[ep_id] = file_id
-                uri_to_ep_id[uri_match.uri] = ep_id
+                uri_to_ep_ids.setdefault(uri_match.uri, []).append(ep_id)
                 ep_id_to_role[ep_id] = role
                 if func_name:
                     ep_id_to_func_name[ep_id] = func_name
+                if http_method:
+                    ep_id_to_http_method[ep_id] = http_method
 
             for func in result.functions:
                 func_key = f"{fpath}::{func.name}:{func.line}"
@@ -214,13 +281,16 @@ class Scanner:
             for impl in result.endpoint_impls:
                 func_key = f"{fpath}::{impl.function_name}:{impl.function_line}"
                 func_id = func_key_to_id.get(func_key, f"func:{_stable_id(func_key)}")
-                ep_id = f"endpoint:{_stable_id(impl.uri)}"
+                ep_id = f"endpoint:{_stable_id(fpath + impl.uri)}"
                 func_id_to_ep_ids.setdefault(func_id, set()).add(ep_id)
                 ep_id_to_func_ids.setdefault(ep_id, set()).add(func_id)
                 ep_id_to_role[ep_id] = "implementation"
                 ep_id_to_func_name[ep_id] = impl.function_name
+                if impl.http_method:
+                    ep_id_to_http_method[ep_id] = impl.http_method
 
         # ── Phase 2: Call edges ───────────────────────────────────────
+        self._progress.on_phase("Phase 2", "Building CALLS_INTERNAL/CALLS_EXTERNAL edges")
         for result in results:
             fpath = normalize_path(result.file_path)
             repo_name = _match_repo(fpath, sorted_roots)
@@ -255,6 +325,7 @@ class Scanner:
                         )
 
         # ── Phase 2.5: CONSUMES edges (Function → Endpoint via HTTP) ──
+        self._progress.on_phase("Phase 2.5", "Building CONSUMES edges")
         # Also enrich Endpoint function_name for reference-role endpoints
         for result in results:
             fpath = normalize_path(result.file_path)
@@ -262,11 +333,18 @@ class Scanner:
             for hc in result.http_calls:
                 caller_func_id = f"func:{_stable_id(hc.caller)}"
 
-                target_ep_id = uri_to_ep_id.get(hc.uri)
-                if target_ep_id is None:
-                    target_ep_id = _fuzzy_match_endpoint(hc.uri, uri_to_ep_id, ep_id_to_role)
+                uri = hc.uri
+                if not uri and hc.var_ref:
+                    uri = resolve_uri_var(fpath, hc.var_ref) or ""
 
-                if target_ep_id is not None:
+                if not uri:
+                    continue
+
+                target_ep_ids = uri_to_ep_ids.get(uri, [])
+                if not target_ep_ids:
+                    target_ep_ids = _fuzzy_match_endpoints(uri, uri_to_ep_ids, ep_id_to_role)
+
+                for target_ep_id in target_ep_ids:
                     edges.append(
                         GraphEdge(
                             rel_type="CONSUMES",
@@ -286,6 +364,7 @@ class Scanner:
                         ep_id_to_role[target_ep_id] = "reference"
 
         # ── Phase 3: IMPLEMENTS / IMPLEMENTED_BY / DEFINED_IN ─────────
+        self._progress.on_phase("Phase 3", "Building IMPLEMENTS/IMPLEMENTED_BY/DEFINED_IN edges")
         seen_impl_edges: set[str] = set()
 
         for func_id, ep_ids in func_id_to_ep_ids.items():
@@ -332,67 +411,67 @@ class Scanner:
                     )
                 )
 
-        # ── Phase 3.5: ROUTES_TO (declaration → implementation) ──────
-        declaration_eps = [
-            (ep_id, ep_props["uri"])
+        # ── Phase 3.5: ROUTES_TO (sub-path matching + HTTP method + scoring) ──
+        self._progress.on_phase("Phase 3.5", "Building ROUTES_TO edges with sub-path scoring")
+        all_eps = [
+            (
+                ep_id,
+                ep_props["uri"],
+                ep_id_to_http_method.get(ep_id, ""),
+                ep_props.get("file_path", ""),
+            )
             for ep_id, ep_props in _iter_endpoint_nodes(nodes)
-            if ep_props.get("role") == "declaration"
-        ]
-        implementation_eps = [
-            (ep_id, ep_props["uri"])
-            for ep_id, ep_props in _iter_endpoint_nodes(nodes)
-            if ep_props.get("role") == "implementation"
         ]
 
-        impl_suffix_index: dict[str, list[tuple[str, str]]] = {}
-        for impl_ep_id, impl_uri in implementation_eps:
-            norm_impl = _PARAM_RE.sub("{}", impl_uri)
-            impl_parts = tuple(p for p in norm_impl.split("/") if p)
-            if len(impl_parts) >= 2:
-                key = "/".join(impl_parts)
-                impl_suffix_index.setdefault(key, []).append((impl_ep_id, impl_uri))
+        subpath_index: dict[str, list[tuple[str, str, str, str]]] = {}
+        for ep_id, uri, http_method, file_path in all_eps:
+            for sp_key in _extract_subpath_keys(uri):
+                subpath_index.setdefault(sp_key, []).append((ep_id, uri, http_method, file_path))
 
         seen_routes_edges: set[str] = set()
-        for decl_ep_id, decl_uri in declaration_eps:
-            norm_decl = _PARAM_RE.sub("{}", decl_uri)
-            decl_parts = [p for p in norm_decl.split("/") if p]
-            matched = False
-            for suffix_len in range(min(len(decl_parts), 8), 1, -1):
-                suffix_key = "/".join(decl_parts[-suffix_len:])
-                if suffix_key in impl_suffix_index:
-                    for impl_ep_id, impl_uri in impl_suffix_index[suffix_key]:
-                        if _uri_suffix_match(decl_uri, impl_uri):
-                            edge_key = f"{decl_ep_id}->ROUTES_TO->{impl_ep_id}"
+        for sp_key, ep_list in subpath_index.items():
+            if len(ep_list) < 2:
+                continue
+            depth = sp_key.count("/") + 1
+            for i in range(len(ep_list)):
+                for j in range(i + 1, len(ep_list)):
+                    ep_a_id, uri_a, method_a, file_a = ep_list[i]
+                    ep_b_id, uri_b, method_b, file_b = ep_list[j]
+
+                    if ep_a_id == ep_b_id:
+                        continue
+
+                    score = _compute_route_score(depth, method_a, method_b, file_a == file_b)
+                    if score < 0:
+                        continue
+
+                    subpath = sp_key
+                    if file_a != file_b:
+                        for from_id, to_id, from_method in [
+                            (ep_a_id, ep_b_id, method_a),
+                            (ep_b_id, ep_a_id, method_b),
+                        ]:
+                            edge_key = f"{from_id}->ROUTES_TO->{to_id}"
                             if edge_key not in seen_routes_edges:
                                 seen_routes_edges.add(edge_key)
+                                merged_method = from_method or method_a or method_b
                                 edges.append(
                                     GraphEdge(
                                         rel_type="ROUTES_TO",
                                         from_label="Endpoint",
-                                        from_id=decl_ep_id,
+                                        from_id=from_id,
                                         to_label="Endpoint",
-                                        to_id=impl_ep_id,
+                                        to_id=to_id,
+                                        properties={
+                                            "score": score,
+                                            "subpath": subpath,
+                                            "http_method": merged_method,
+                                        },
                                     )
                                 )
-                    matched = True
-                    break
-            if not matched:
-                for impl_ep_id, impl_uri in implementation_eps:
-                    if _uri_suffix_match(decl_uri, impl_uri):
-                        edge_key = f"{decl_ep_id}->ROUTES_TO->{impl_ep_id}"
-                        if edge_key not in seen_routes_edges:
-                            seen_routes_edges.add(edge_key)
-                            edges.append(
-                                GraphEdge(
-                                    rel_type="ROUTES_TO",
-                                    from_label="Endpoint",
-                                    from_id=decl_ep_id,
-                                    to_label="Endpoint",
-                                    to_id=impl_ep_id,
-                                )
-                            )
 
         # ── Phase 4: Endpoint CALLS Endpoint (derived) ───────────────
+        self._progress.on_phase("Phase 4", "Building derived Endpoint CALLS Endpoint edges")
         seen_ep_call_edges: set[str] = set()
 
         # Path 1: func implements epA, func CONSUMES epB → epA CALLS epB
@@ -462,7 +541,7 @@ class Scanner:
                             )
                         )
 
-        # Enrich Endpoint nodes with final role/function_name
+        # Enrich Endpoint nodes with final role/function_name/http_method
         for _i, node in enumerate(nodes):
             if node.label != "Endpoint":
                 continue
@@ -471,6 +550,8 @@ class Scanner:
                 node.properties["role"] = ep_id_to_role[ep_id]
             if ep_id in ep_id_to_func_name and "function_name" not in node.properties:
                 node.properties["function_name"] = ep_id_to_func_name[ep_id]
+            if ep_id in ep_id_to_http_method and "http_method" not in node.properties:
+                node.properties["http_method"] = ep_id_to_http_method[ep_id]
 
         return nodes, edges
 
@@ -575,6 +656,41 @@ def _iter_endpoint_nodes(nodes: list[GraphNode]):
             yield node.properties["id"], node.properties
 
 
+def _extract_subpath_keys(uri: str) -> list[str]:
+    """Extract all sub-path keys of length >= 2 from a URI."""
+    normalized = _PARAM_RE.sub("{}", uri)
+    parts = [p for p in normalized.split("/") if p]
+    keys: list[str] = []
+    for i in range(len(parts) - 1):
+        subpath = "/".join(parts[i:])
+        keys.append(subpath)
+    return keys
+
+
+def _compute_route_score(
+    depth: int,
+    method_a: str,
+    method_b: str,
+    same_file: bool,
+) -> int:
+    """Compute a score for a ROUTES_TO edge candidate.
+
+    Returns -1 if the edge should be rejected (methods explicitly conflict).
+    """
+    score = depth
+    if method_a and method_b:
+        if method_a != method_b:
+            return -1
+        score += 5
+    elif not method_a or not method_b:
+        score += 1
+    else:
+        score += 2
+    if same_file:
+        score -= 3
+    return score
+
+
 def _uri_suffix_match(decl_uri: str, impl_uri: str) -> bool:
     """Check if a declaration URI suffix-matches an implementation URI.
 
@@ -595,18 +711,77 @@ def _uri_suffix_match(decl_uri: str, impl_uri: str) -> bool:
     return decl_tail == impl_parts
 
 
-def _fuzzy_match_endpoint(
+def _uri_reverse_match(uri1: str, uri2: str, min_segments: int = 2) -> bool:
+    """Reverse segment matching: compare non-parameter segments from end to start.
+
+    Rules:
+    1. Normalize parameters: ${xxx}/{yyy} → {}/{}
+    2. Slash handling: auto-add leading slash if missing (scheme A)
+    3. Compare including {} placeholders for position alignment
+    4. Count matched non-{} segments
+    5. Match if: matched >= min_segments OR all non-{} segments of shorter URI matched
+
+    Example:
+    - /api/users/{id} vs v1/rest/api/users/{id} → True (matches "users", "api")
+    - /rest/api/proc/{id} vs v1/rest/api/users/{id} → False ("proc" != "users")
+    """
+    norm1 = _PARAM_RE.sub("{}", uri1)
+    norm2 = _PARAM_RE.sub("{}", uri2)
+
+    if not norm1.startswith("/"):
+        norm1 = "/" + norm1
+    if not norm2.startswith("/"):
+        norm2 = "/" + norm2
+
+    parts1 = [p for p in norm1.split("/") if p]
+    parts2 = [p for p in norm2.split("/") if p]
+
+    if not parts1 or not parts2:
+        return False
+
+    i = len(parts1) - 1
+    j = len(parts2) - 1
+    matched = 0
+
+    while i >= 0 and j >= 0:
+        if parts1[i] == parts2[j]:
+            if parts1[i] != "{}":
+                matched += 1
+            i -= 1
+            j -= 1
+        else:
+            break
+
+    if matched >= min_segments:
+        return True
+
+    shorter_parts = parts1 if len(parts1) <= len(parts2) else parts2
+    shorter_non_param = [p for p in shorter_parts if p != "{}"]
+
+    if shorter_non_param and matched == len(shorter_non_param):
+        return True
+
+    return False
+
+
+def _fuzzy_match_endpoints(
     uri: str,
-    uri_to_ep_id: dict[str, str],
+    uri_to_ep_ids: dict[str, list[str]],
     ep_id_to_role: dict[str, str],
-) -> str | None:
+) -> list[str]:
     """Try suffix-matching a URI against implementation-role endpoints."""
-    for existing_uri, ep_id in uri_to_ep_id.items():
-        if ep_id_to_role.get(ep_id) != "implementation":
-            continue
-        if _uri_suffix_match(uri, existing_uri) or _uri_suffix_match(existing_uri, uri):
-            return ep_id
-    return None
+    matched: list[str] = []
+    for existing_uri, ep_ids in uri_to_ep_ids.items():
+        for ep_id in ep_ids:
+            if ep_id_to_role.get(ep_id) != "implementation":
+                continue
+            if (
+                _uri_suffix_match(uri, existing_uri)
+                or _uri_suffix_match(existing_uri, uri)
+                or _uri_reverse_match(uri, existing_uri)
+            ):
+                matched.append(ep_id)
+    return matched
 
 
 def _match_repo(fpath: str, sorted_roots: list[str]) -> str:
@@ -662,6 +837,8 @@ def _lookup_callee(
 def _stable_id(text: str) -> str:
     """Generate a deterministic short id from text."""
     if "::" in text:
+        return hashlib.sha256(text.encode()).hexdigest()[:16]
+    if text.startswith("/"):
         return hashlib.sha256(text.encode()).hexdigest()[:16]
     normalized = sanitize_for_id(text)
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]

@@ -9,11 +9,12 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 
 from bridgetrace.analysis.trace_engine import TraceEngine
 from bridgetrace.config import settings
-from bridgetrace.core.scanner import Scanner
+from bridgetrace.core.scanner import Scanner, ScanProgress
 from bridgetrace.storage.group_manager import GroupManager
 from bridgetrace.storage.neo4j_client import Neo4jClient
 
@@ -26,6 +27,36 @@ group_app = typer.Typer(help="Manage logical groups of repository paths.")
 app.add_typer(group_app, name="group")
 
 console = Console()
+
+
+class RichScanProgress(ScanProgress):
+    def __init__(self) -> None:
+        self._progress: Progress | None = None
+        self._task_id: int = 0
+
+    def on_discovery(self, total_files: int) -> None:
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            console=console,
+        )
+        self._progress.start()
+        self._task_id = self._progress.add_task("Parsing files", total=total_files)
+
+    def on_file_parsed(self, index: int, path: str) -> None:
+        if self._progress:
+            self._progress.update(self._task_id, completed=index)
+
+    def on_phase(self, phase: str, detail: str = "") -> None:
+        if self._progress:
+            self._progress.update(self._task_id, description=f"{phase}: {detail}")
+
+    def finish(self) -> None:
+        if self._progress:
+            self._progress.stop()
 
 
 def _setup_logging(level: str | None = None) -> None:
@@ -56,10 +87,12 @@ def scan(
             raise typer.Exit(1)
 
     paths = [Path(p) for p in grp.paths]
-    scanner = Scanner()
+    progress = RichScanProgress()
+    scanner = Scanner(progress=progress)
     results = scanner.scan_paths(paths)
 
     nodes, edges = scanner.build_graph_entities(results, group, grp.paths)
+    progress.finish()
 
     with Neo4jClient() as client:
         if bootstrap:
@@ -101,6 +134,9 @@ def trace(
     cross_repo: bool = typer.Option(
         False, "--cross-repo", help="Trace cross-repo routing (gateway → backend)."
     ),
+    http_method: str = typer.Option(
+        "", "--method", "-m", help="HTTP method filter (GET, POST, etc.)."
+    ),
 ) -> None:
     """Trace the full topology chain for a given URI."""
     _setup_logging()
@@ -112,7 +148,7 @@ def trace(
         elif cross_repo:
             result = engine.trace_cross_repo(uri)
         else:
-            result = engine.trace_uri(uri, group)
+            result = engine.trace_uri(uri, group, http_method=http_method)
 
     if json_output:
         console.print_json(json.dumps(result.to_dict_list()))

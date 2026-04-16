@@ -32,8 +32,14 @@ class TestNormalizePath:
 
 
 class TestIsPathLike:
-    def test_unix_path(self):
-        assert is_path_like("/home/user/file")
+    def test_unix_path_with_extension(self):
+        assert is_path_like("/home/user/file.py")
+
+    def test_api_uri_with_params(self):
+        assert not is_path_like("/v1/users/{id}")
+
+    def test_api_uri_without_params(self):
+        assert not is_path_like("/api/v1/users")
 
     def test_windows_path(self):
         assert is_path_like("C:\\Users\\file")

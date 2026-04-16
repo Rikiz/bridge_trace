@@ -11,6 +11,7 @@ class URIMatch(BaseModel):
     uri: str
     source_file: str
     role: str = ""
+    http_method: str = ""
 
 
 class FunctionDef(BaseModel):
@@ -37,15 +38,38 @@ class EndpointImpl(BaseModel):
     uri: str
     function_name: str
     function_line: int
+    http_method: str = ""
 
 
 class HttpCall(BaseModel):
     """An HTTP client call to an external endpoint."""
 
     caller: str
-    uri: str
+    uri: str = ""
     http_method: str = ""
     line: int = 0
+    var_ref: str = ""
+
+
+class URIVariableDef(BaseModel):
+    """A variable that holds a URI value."""
+
+    name: str
+    uri: str
+    file_path: str
+    line: int
+    scope: str = ""
+    is_exported: bool = False
+
+
+class ImportMapping(BaseModel):
+    """An import statement that maps local names to external sources."""
+
+    local_name: str
+    source_name: str
+    source_file: str
+    file_path: str
+    line: int
 
 
 class ParseResult(BaseModel):
@@ -57,6 +81,8 @@ class ParseResult(BaseModel):
     calls: list[CallEdge] = Field(default_factory=list)
     endpoint_impls: list[EndpointImpl] = Field(default_factory=list)
     http_calls: list[HttpCall] = Field(default_factory=list)
+    uri_vars: list[URIVariableDef] = Field(default_factory=list)
+    imports: list[ImportMapping] = Field(default_factory=list)
 
 
 class GraphNode(BaseModel):
