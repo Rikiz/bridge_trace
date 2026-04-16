@@ -121,9 +121,9 @@ RETURN ep.uri AS endpoint,
        chain_rel_types,
        cross_ep.uri AS cross_endpoint,
        cross_ep.role AS cross_role,
-       cross_ep.file_path AS cross_file,
+       cross_ep.file_path AS cross_ep_file,
        cross_func.name AS cross_function,
-       cross_func.file_path AS cross_file,
+       cross_func.file_path AS cross_func_file,
        length(path) AS hop_distance
 ORDER BY hop_distance
 """
