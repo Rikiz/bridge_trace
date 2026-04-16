@@ -99,6 +99,35 @@ RETURN ep.uri AS endpoint,
        called_func.file_path AS called_file
 """
 
+_TRACE_CROSS_REPO_MULTI_HOP_CYPHER = """
+MATCH (ep:Endpoint {uri: $uri})
+OPTIONAL MATCH (ep)-[:IMPLEMENTED_BY]->(impl_func:Function)
+OPTIONAL MATCH path=(ep)-[:ROUTES_TO|CALLS*1..5]->(cross_ep:Endpoint)
+OPTIONAL MATCH (cross_ep)-[:IMPLEMENTED_BY]->(cross_func:Function)
+WITH ep, impl_func, path, cross_ep, cross_func,
+     [n IN nodes(path) WHERE 'Endpoint' IN labels(n) | n.uri] AS chain_uris,
+     [n IN nodes(path) WHERE 'Endpoint' IN labels(n) | n.role] AS chain_roles,
+     [n IN nodes(path) WHERE 'Endpoint' IN labels(n) | n.file_path] AS chain_files,
+     [r IN relationships(path) | type(r)] AS chain_rel_types
+RETURN ep.uri AS endpoint,
+       ep.role AS role,
+       ep.file_path AS file_path,
+       ep.function_name AS function_name,
+       impl_func.name AS implementing_function,
+       impl_func.file_path AS implementing_file,
+       chain_uris,
+       chain_roles,
+       chain_files,
+       chain_rel_types,
+       cross_ep.uri AS cross_endpoint,
+       cross_ep.role AS cross_role,
+       cross_ep.file_path AS cross_file,
+       cross_func.name AS cross_function,
+       cross_func.file_path AS cross_file,
+       length(path) AS hop_distance
+ORDER BY hop_distance
+"""
+
 _TRACE_SUBPATH_FUZZY_CYPHER = """
 UNWIND $ep_ids AS eid
 MATCH (ep:Endpoint {id: eid})
@@ -162,9 +191,14 @@ class TraceResult:
         if self.strategy:
             lines.append(f"[Strategy: {self.strategy}]")
         for i, rec in enumerate(self.records, 1):
-            lines.append(f"--- Hop {i} ---")
+            hop_type = (
+                "intra-service" if "caller_name" in rec or "callee_name" in rec else "cross-service"
+            )
+            lines.append(f"--- Hop {i} ({hop_type}) ---")
             for key, val in rec.items():
                 if val is not None:
+                    if isinstance(val, list):
+                        val = " -> ".join(str(v) for v in val if v)
                     lines.append(f"  {key}: {val}")
         return "\n".join(lines)
 
@@ -240,48 +274,87 @@ class TraceEngine:
     def trace_uri(self, uri: str, group: str | None = None, http_method: str = "") -> TraceResult:
         """Trace the full topology for a given URI path.
 
-        Multi-strategy approach:
-          1. Exact URI match (call-chain + cross-repo)
-          2. Normalized URI match (${id} → {id})
-          3. Sub-path fuzzy match
-          4. URI contains fallback
+        Multi-strategy aggregation approach:
+          Phase A: Intra-service call chain (exact + normalized)
+          Phase B: Cross-service routing (multi-hop ROUTES_TO/CALLS)
+          Phase C: Sub-path fuzzy match fallback
+          Phase D: URI contains fallback
+
+        Results from all successful phases are merged and deduplicated.
         """
-        # Strategy 1: Exact match
+        all_records: list[dict[str, Any]] = []
+        strategy_parts: list[str] = []
+        seen_sigs: set[str] = set()
+
+        # Phase A: Intra-service call chain
+        exact_uri = uri
         if group:
             records = self._client.run(_TRACE_FULL_CYPHER, {"uri": uri, "group": group})
         else:
             records = self._client.run(_TRACE_CYPHER, {"uri": uri})
 
+        if not records:
+            normalized = _normalize_uri_params(uri)
+            if normalized != uri:
+                logger.info("Exact match failed, trying normalized URI: %s -> %s", uri, normalized)
+                exact_uri = normalized
+                if group:
+                    records = self._client.run(
+                        _TRACE_FULL_CYPHER, {"uri": normalized, "group": group}
+                    )
+                else:
+                    records = self._client.run(_TRACE_CYPHER, {"uri": normalized})
+                if records:
+                    strategy_parts.append("normalized_match")
+
         if records:
-            return TraceResult(records, "exact_match")
+            if not strategy_parts:
+                strategy_parts.append("exact_match")
+            for r in records:
+                sig = self._record_sig(r)
+                if sig not in seen_sigs:
+                    seen_sigs.add(sig)
+                    all_records.append(r)
 
-        # Try cross-repo via exact URI
-        records = self._client.run(_TRACE_CROSS_REPO_FULL_CYPHER, {"uri": uri})
+        # Phase B: Cross-service routing (always attempted)
         if records:
-            return TraceResult(records, "exact_cross_repo")
+            uris_for_cross = [exact_uri]
+        elif exact_uri != uri:
+            uris_for_cross = [exact_uri, uri]
+        else:
+            uris_for_cross = [uri]
 
-        # Strategy 2: Normalized URI match
-        normalized = _normalize_uri_params(uri)
-        if normalized != uri:
-            logger.info("Exact match failed, trying normalized URI: %s → %s", uri, normalized)
-            if group:
-                records = self._client.run(_TRACE_FULL_CYPHER, {"uri": normalized, "group": group})
-            else:
-                records = self._client.run(_TRACE_CYPHER, {"uri": normalized})
-            if not records:
-                records = self._client.run(_TRACE_CROSS_REPO_FULL_CYPHER, {"uri": normalized})
-            if records:
-                return TraceResult(records, "normalized_match")
+        cross_records: list[dict[str, Any]] = []
+        for try_uri in uris_for_cross:
+            cross_records = self._client.run(_TRACE_CROSS_REPO_MULTI_HOP_CYPHER, {"uri": try_uri})
+            if cross_records:
+                break
+        if not cross_records:
+            for try_uri in uris_for_cross:
+                cross_records = self._client.run(_TRACE_CROSS_REPO_FULL_CYPHER, {"uri": try_uri})
+                if cross_records:
+                    break
 
-        # Strategy 3: Sub-path fuzzy match
-        logger.info("Normalized match failed, trying sub-path fuzzy: %s", uri)
+        if cross_records:
+            for r in cross_records:
+                sig = self._record_sig(r)
+                if sig not in seen_sigs:
+                    seen_sigs.add(sig)
+                    all_records.append(r)
+            strategy_parts.append("cross_repo")
+
+        if all_records:
+            return TraceResult(all_records, "+".join(strategy_parts))
+
+        # Phase C: Sub-path fuzzy match
+        logger.info("Exact + cross-repo failed, trying sub-path fuzzy: %s", uri)
         ep_ids = self._find_endpoint_ids_by_subpath(uri, http_method)
         if ep_ids:
             records = self._client.run(_TRACE_SUBPATH_FUZZY_CYPHER, {"ep_ids": ep_ids})
             if records:
                 return TraceResult(records, "subpath_fuzzy")
 
-        # Strategy 4: URI contains fallback
+        # Phase D: URI contains fallback
         logger.info("Sub-path fuzzy failed, trying URI contains: %s", uri)
         suffix = _PARAM_RE.sub("{}", uri).rsplit("/", 2)[-1] if "/" in uri else uri
         if suffix:
@@ -290,6 +363,11 @@ class TraceEngine:
                 return TraceResult(records, "uri_contains")
 
         return TraceResult([], "")
+
+    @staticmethod
+    def _record_sig(rec: dict[str, Any]) -> str:
+        """Lightweight dedup signature for a trace record."""
+        return "|".join(f"{k}={v}" for k, v in sorted(rec.items()) if v is not None)
 
     def trace_uri_to_implementation(self, uri: str, group: str) -> TraceResult:
         """Trace from URI to backend implementation function."""

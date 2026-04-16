@@ -46,6 +46,25 @@ class TestTraceResult:
         result = TraceResult([{"x": 1}], strategy="subpath_fuzzy")
         assert "subpath_fuzzy" in result.format_text()
 
+    def test_intra_service_hop_label(self):
+        result = TraceResult([{"caller_name": "handler", "callee_name": "processor"}])
+        text = result.format_text()
+        assert "intra-service" in text
+
+    def test_cross_service_hop_label(self):
+        result = TraceResult([{"endpoint": "/v1/users", "routed_endpoint": "/data/v1/users"}])
+        text = result.format_text()
+        assert "cross-service" in text
+
+    def test_list_values_formatted(self):
+        result = TraceResult([{"chain_uris": ["/v1/users", "/data/v1/users", None]}])
+        text = result.format_text()
+        assert "/v1/users -> /data/v1/users" in text
+
+    def test_combined_strategy(self):
+        result = TraceResult([{"x": 1}], strategy="exact_match+cross_repo")
+        assert "exact_match+cross_repo" in result.format_text()
+
 
 class TestTraceEngine:
     def _make_engine(self, records=None):
@@ -53,8 +72,27 @@ class TestTraceEngine:
         mock_client.run.return_value = records or []
         return TraceEngine(mock_client), mock_client
 
-    def test_trace_uri_exact_match(self):
-        engine, mock_client = self._make_engine([{"caller_name": "a"}])
+    def test_trace_uri_exact_match_includes_cross_repo(self):
+        engine, mock_client = self._make_engine()
+        intra_record = {"caller_name": "a"}
+        cross_record = {"endpoint": "/v1/users", "routed_endpoint": "/data/v1/users"}
+        mock_client.run.side_effect = [
+            [intra_record],
+            [cross_record],
+        ]
+        result = engine.trace_uri("/api/v1/users", group="myservice")
+        assert len(result.records) == 2
+        assert "exact_match" in result.strategy
+        assert "cross_repo" in result.strategy
+
+    def test_trace_uri_exact_match_no_cross_repo(self):
+        engine, mock_client = self._make_engine()
+        intra_record = {"caller_name": "a"}
+        mock_client.run.side_effect = [
+            [intra_record],
+            [],
+            [],
+        ]
         result = engine.trace_uri("/api/v1/users", group="myservice")
         assert len(result.records) == 1
         assert result.strategy == "exact_match"
@@ -62,12 +100,34 @@ class TestTraceEngine:
     def test_trace_uri_normalized_fallback(self):
         engine, mock_client = self._make_engine()
         mock_client.run.side_effect = [
-            [],  # exact match fails
-            [],  # cross_repo_full exact fails
-            [{"endpoint": "/api/v1/users"}],  # normalized match succeeds
+            [],
+            [{"caller_name": "handler"}],
+            [{"endpoint": "/api/v1/users", "routed_endpoint": "/data/v1/users"}],
         ]
         result = engine.trace_uri("/api/v1/users/${id}")
-        assert result.strategy == "normalized_match"
+        assert "normalized_match" in result.strategy
+        assert "cross_repo" in result.strategy
+
+    def test_trace_uri_deduplication(self):
+        engine, mock_client = self._make_engine()
+        dup_record = {"caller_name": "a", "callee_name": "b"}
+        mock_client.run.side_effect = [
+            [dup_record],
+            [dup_record],
+        ]
+        result = engine.trace_uri("/api/v1/users", group="myservice")
+        assert len(result.records) == 1
+
+    def test_trace_uri_cross_repo_only(self):
+        engine, mock_client = self._make_engine()
+        cross_record = {"endpoint": "/v1/users", "routed_endpoint": "/data/v1/users"}
+        mock_client.run.side_effect = [
+            [],
+            [cross_record],
+        ]
+        result = engine.trace_uri("/api/v1/users", group="myservice")
+        assert "cross_repo" in result.strategy
+        assert len(result.records) == 1
 
     def test_trace_uri_to_implementation(self):
         engine, mock_client = self._make_engine([{"impl_name": "getUser"}])
@@ -93,3 +153,40 @@ class TestTraceEngine:
         engine, mock_client = self._make_engine()
         result = engine.trace_uri("/nonexistent")
         assert len(result.records) == 0
+
+    def test_record_sig(self):
+        rec = {"a": 1, "b": None, "c": "x"}
+        sig = TraceEngine._record_sig(rec)
+        assert "a=1" in sig
+        assert "c=x" in sig
+        assert "b" not in sig
+
+    def test_trace_uri_multi_hop_preference(self):
+        engine, mock_client = self._make_engine()
+        multi_hop_record = {
+            "endpoint": "/v1/users",
+            "chain_uris": ["/v1/users", "/data/v1/users"],
+            "cross_endpoint": "/data/v1/users",
+            "hop_distance": 1,
+        }
+        mock_client.run.side_effect = [
+            [],
+            [multi_hop_record],
+        ]
+        result = engine.trace_uri("/v1/users")
+        assert "cross_repo" in result.strategy
+        assert len(result.records) == 1
+
+    def test_trace_uri_subpath_fuzzy_fallback(self):
+        engine, mock_client = self._make_engine()
+        fuzzy_record = {"endpoint": "/v1/users", "role": "reference"}
+        mock_client.run.side_effect = [
+            [],
+            [],
+            [],
+            [{"id": "ep:123", "http_method": ""}],
+            [],
+            [fuzzy_record],
+        ]
+        result = engine.trace_uri("/v1/users/unknown")
+        assert result.strategy == "subpath_fuzzy"
